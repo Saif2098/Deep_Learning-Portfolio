@@ -1,0 +1,7095 @@
+package raftkv
+
+import "labrpc"
+import "crypto/rand"
+import (
+	"math/big"
+	"sync"
+)
+
+type Clerk struct {
+	servers []*labrpc.ClientEnd
+	// You will have to modify this struct.
+	mu sync.Mutex
+	leader	int
+	clientId 	int64
+	requestId	int
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
+func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+	ck := new(Clerk)
+	ck.servers = servers
+
+	// You'll have to add code here.
+	ck.leader = 0
+	ck.requestId = 0
+	ck.clientId = nrand()
+
+	return ck
+}
+
+//
+// fetch the current value for a key.
+// returns "" if the key does not exist.
+// keeps trying forever in the face of all other errors.
+//
+// you can send an RPC with code like this:
+// ok := ck.servers[i].Call("RaftKV.Get", args, &reply)
+//
+func (ck *Clerk) Get(key string) string {
+	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := GetArgs {Key: key, ClientId: ck.clientId, RequestId: ck.requestId}
+	ck.requestId++
+	//ck.mu.Unlock()
+	//DPrintf("[%d] send GET with [%d]", ck.clientId, args.RequestId)
+	//!!! dead loop
+	ret := ""
+	for i := ck.leader; true; i = (i + 1) % len(ck.servers) {
+		reply := GetReply{}
+		server := ck.servers[i]
+		if server.Call("RaftKV.Get", &args, &reply) {
+			if !reply.WrongLeader {
+				ck.leader = i
+				if reply.Err == OK {
+					//DPrintf("[%d] Receive GET reply with [%d]", ck.clientId, args.RequestId)
+					ret = reply.Value
+					break
+				} else {
+					ret = ""
+					break
+				}
+			}
+		}
+	}
+	return ret
+}
+
+//
+// shared by Put and Append.
+//
+// you can send an RPC with code like this:
+// ok := ck.servers[i].Call("RaftKV.PutAppend", args, &reply)
+//
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := PutAppendArgs {Key: key, Value: value, Op: op, ClientId: ck.clientId, RequestId: ck.requestId}
+	ck.requestId++
+	//ck.mu.Unlock()
+	//DPrintf("[%d] send PUTAPPEND with [%d]", ck.clientId, args.RequestId)
+	//!!! dead loop
+	for i := ck.leader; true; i = (i + 1) % len(ck.servers) {
+		//!!! Attention: where to declare a variable
+		reply := PutAppendReply{}
+		server := ck.servers[i]
+		if server.Call("RaftKV.PutAppend", &args, &reply) {
+			if !reply.WrongLeader {
+				//DPrintf("[%d] Receive PUTAPPEND reply with [%d]", ck.clientId, args.RequestId)
+				ck.leader = i
+				return
+			}
+		}
+	}
+
+}
+
+func (ck *Clerk) Put(key string, value string) {
+	ck.PutAppend(key, value, "Put")
+}
+func (ck *Clerk) Append(key string, value string) {
+	ck.PutAppend(key, value, "Append")
+}
+
+package raftkv
+
+const (
+	OK       = "OK"
+	ErrNoKey = "ErrNoKey"
+)
+
+type Err string
+
+// Put or Append
+type PutAppendArgs struct {
+	// You'll have to add definitions here.
+	Key   string
+	Value string
+	Op    string // "Put" or "Append"
+	// You'll have to add definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	ClientId	int64
+	RequestId	int
+}
+
+type PutAppendReply struct {
+	WrongLeader bool
+	Err         Err
+}
+
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+	ClientId	int64
+	RequestId	int
+}
+
+type GetReply struct {
+	WrongLeader bool
+	Err         Err
+	Value       string
+}
+
+package raftkv
+
+import "labrpc"
+import "testing"
+import "os"
+
+// import "log"
+import crand "crypto/rand"
+import "math/rand"
+import "encoding/base64"
+import "sync"
+import "runtime"
+import "raft"
+
+func randstring(n int) string {
+	b := make([]byte, 2*n)
+	crand.Read(b)
+	s := base64.URLEncoding.EncodeToString(b)
+	return s[0:n]
+}
+
+// Randomize server handles
+func random_handles(kvh []*labrpc.ClientEnd) []*labrpc.ClientEnd {
+	sa := make([]*labrpc.ClientEnd, len(kvh))
+	copy(sa, kvh)
+	for i := range sa {
+		j := rand.Intn(i + 1)
+		sa[i], sa[j] = sa[j], sa[i]
+	}
+	return sa
+}
+
+type config struct {
+	mu           sync.Mutex
+	t            *testing.T
+	tag          string
+	net          *labrpc.Network
+	n            int
+	kvservers    []*RaftKV
+	saved        []*raft.Persister
+	endnames     [][]string // names of each server's sending ClientEnds
+	clerks       map[*Clerk][]string
+	nextClientId int
+	maxraftstate int
+}
+
+func (cfg *config) cleanup() {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	for i := 0; i < len(cfg.kvservers); i++ {
+		if cfg.kvservers[i] != nil {
+			cfg.kvservers[i].Kill()
+		}
+	}
+}
+
+// Maximum log size across all servers
+func (cfg *config) LogSize() int {
+	logsize := 0
+	for i := 0; i < cfg.n; i++ {
+		n := cfg.saved[i].RaftStateSize()
+		if n > logsize {
+			logsize = n
+		}
+	}
+	return logsize
+}
+
+// attach server i to servers listed in to
+// caller must hold cfg.mu
+func (cfg *config) connectUnlocked(i int, to []int) {
+	// log.Printf("connect peer %d to %v\n", i, to)
+
+	// outgoing socket files
+	for j := 0; j < len(to); j++ {
+		endname := cfg.endnames[i][to[j]]
+		cfg.net.Enable(endname, true)
+	}
+
+	// incoming socket files
+	for j := 0; j < len(to); j++ {
+		endname := cfg.endnames[to[j]][i]
+		cfg.net.Enable(endname, true)
+	}
+}
+
+func (cfg *config) connect(i int, to []int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	cfg.connectUnlocked(i, to)
+}
+
+// detach server i from the servers listed in from
+// caller must hold cfg.mu
+func (cfg *config) disconnectUnlocked(i int, from []int) {
+	// log.Printf("disconnect peer %d from %v\n", i, from)
+
+	// outgoing socket files
+	for j := 0; j < len(from); j++ {
+		if cfg.endnames[i] != nil {
+			endname := cfg.endnames[i][from[j]]
+			cfg.net.Enable(endname, false)
+		}
+	}
+
+	// incoming socket files
+	for j := 0; j < len(from); j++ {
+		if cfg.endnames[j] != nil {
+			endname := cfg.endnames[from[j]][i]
+			cfg.net.Enable(endname, false)
+		}
+	}
+}
+
+func (cfg *config) disconnect(i int, from []int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	cfg.disconnectUnlocked(i, from)
+}
+
+func (cfg *config) All() []int {
+	all := make([]int, cfg.n)
+	for i := 0; i < cfg.n; i++ {
+		all[i] = i
+	}
+	return all
+}
+
+func (cfg *config) ConnectAll() {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	for i := 0; i < cfg.n; i++ {
+		cfg.connectUnlocked(i, cfg.All())
+	}
+}
+
+// Sets up 2 partitions with connectivity between servers in each  partition.
+func (cfg *config) partition(p1 []int, p2 []int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	// log.Printf("partition servers into: %v %v\n", p1, p2)
+	for i := 0; i < len(p1); i++ {
+		cfg.disconnectUnlocked(p1[i], p2)
+		cfg.connectUnlocked(p1[i], p1)
+	}
+	for i := 0; i < len(p2); i++ {
+		cfg.disconnectUnlocked(p2[i], p1)
+		cfg.connectUnlocked(p2[i], p2)
+	}
+}
+
+// Create a clerk with clerk specific server names.
+// Give it connections to all of the servers, but for
+// now enable only connections to servers in to[].
+func (cfg *config) makeClient(to []int) *Clerk {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	// a fresh set of ClientEnds.
+	ends := make([]*labrpc.ClientEnd, cfg.n)
+	endnames := make([]string, cfg.n)
+	for j := 0; j < cfg.n; j++ {
+		endnames[j] = randstring(20)
+		ends[j] = cfg.net.MakeEnd(endnames[j])
+		cfg.net.Connect(endnames[j], j)
+	}
+
+	ck := MakeClerk(random_handles(ends))
+	cfg.clerks[ck] = endnames
+	cfg.nextClientId++
+	cfg.ConnectClientUnlocked(ck, to)
+	return ck
+}
+
+func (cfg *config) deleteClient(ck *Clerk) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	v := cfg.clerks[ck]
+	for i := 0; i < len(v); i++ {
+		os.Remove(v[i])
+	}
+	delete(cfg.clerks, ck)
+}
+
+// caller should hold cfg.mu
+func (cfg *config) ConnectClientUnlocked(ck *Clerk, to []int) {
+	// log.Printf("ConnectClient %v to %v\n", ck, to)
+	endnames := cfg.clerks[ck]
+	for j := 0; j < len(to); j++ {
+		s := endnames[to[j]]
+		cfg.net.Enable(s, true)
+	}
+}
+
+func (cfg *config) ConnectClient(ck *Clerk, to []int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	cfg.ConnectClientUnlocked(ck, to)
+}
+
+// caller should hold cfg.mu
+func (cfg *config) DisconnectClientUnlocked(ck *Clerk, from []int) {
+	// log.Printf("DisconnectClient %v from %v\n", ck, from)
+	endnames := cfg.clerks[ck]
+	for j := 0; j < len(from); j++ {
+		s := endnames[from[j]]
+		cfg.net.Enable(s, false)
+	}
+}
+
+func (cfg *config) DisconnectClient(ck *Clerk, from []int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	cfg.DisconnectClientUnlocked(ck, from)
+}
+
+// Shutdown a server by isolating it
+func (cfg *config) ShutdownServer(i int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	cfg.disconnectUnlocked(i, cfg.All())
+
+	// disable client connections to the server.
+	// it's important to do this before creating
+	// the new Persister in saved[i], to avoid
+	// the possibility of the server returning a
+	// positive reply to an Append but persisting
+	// the result in the superseded Persister.
+	cfg.net.DeleteServer(i)
+
+	// a fresh persister, in case old instance
+	// continues to update the Persister.
+	// but copy old persister's content so that we always
+	// pass Make() the last persisted state.
+	if cfg.saved[i] != nil {
+		cfg.saved[i] = cfg.saved[i].Copy()
+	}
+
+	kv := cfg.kvservers[i]
+	if kv != nil {
+		cfg.mu.Unlock()
+		kv.Kill()
+		cfg.mu.Lock()
+		cfg.kvservers[i] = nil
+	}
+}
+
+// If restart servers, first call ShutdownServer
+func (cfg *config) StartServer(i int) {
+	cfg.mu.Lock()
+
+	// a fresh set of outgoing ClientEnd names.
+	cfg.endnames[i] = make([]string, cfg.n)
+	for j := 0; j < cfg.n; j++ {
+		cfg.endnames[i][j] = randstring(20)
+	}
+
+	// a fresh set of ClientEnds.
+	ends := make([]*labrpc.ClientEnd, cfg.n)
+	for j := 0; j < cfg.n; j++ {
+		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
+		cfg.net.Connect(cfg.endnames[i][j], j)
+	}
+
+	// a fresh persister, so old instance doesn't overwrite
+	// new instance's persisted state.
+	// give the fresh persister a copy of the old persister's
+	// state, so that the spec is that we pass StartKVServer()
+	// the last persisted state.
+	if cfg.saved[i] != nil {
+		cfg.saved[i] = cfg.saved[i].Copy()
+	} else {
+		cfg.saved[i] = raft.MakePersister()
+	}
+	cfg.mu.Unlock()
+
+	cfg.kvservers[i] = StartKVServer(ends, i, cfg.saved[i], cfg.maxraftstate)
+
+	kvsvc := labrpc.MakeService(cfg.kvservers[i])
+	rfsvc := labrpc.MakeService(cfg.kvservers[i].rf)
+	srv := labrpc.MakeServer()
+	srv.AddService(kvsvc)
+	srv.AddService(rfsvc)
+	cfg.net.AddServer(i, srv)
+}
+
+func (cfg *config) Leader() (bool, int) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	for i := 0; i < cfg.n; i++ {
+		_, is_leader := cfg.kvservers[i].rf.GetState()
+		if is_leader {
+			return true, i
+		}
+	}
+	return false, 0
+}
+
+// Partition servers into 2 groups and put current leader in minority
+func (cfg *config) make_partition() ([]int, []int) {
+	_, l := cfg.Leader()
+	p1 := make([]int, cfg.n/2+1)
+	p2 := make([]int, cfg.n/2)
+	j := 0
+	for i := 0; i < cfg.n; i++ {
+		if i != l {
+			if j < len(p1) {
+				p1[j] = i
+			} else {
+				p2[j-len(p1)] = i
+			}
+			j++
+		}
+	}
+	p2[len(p2)-1] = l
+	return p1, p2
+}
+
+func make_config(t *testing.T, tag string, n int, unreliable bool, maxraftstate int) *config {
+	runtime.GOMAXPROCS(4)
+	cfg := &config{}
+	cfg.t = t
+	cfg.tag = tag
+	cfg.net = labrpc.MakeNetwork()
+	cfg.n = n
+	cfg.kvservers = make([]*RaftKV, cfg.n)
+	cfg.saved = make([]*raft.Persister, cfg.n)
+	cfg.endnames = make([][]string, cfg.n)
+	cfg.clerks = make(map[*Clerk][]string)
+	cfg.nextClientId = cfg.n + 1000 // client ids start 1000 above the highest serverid
+	cfg.maxraftstate = maxraftstate
+
+	// create a full set of KV servers.
+	for i := 0; i < cfg.n; i++ {
+		cfg.StartServer(i)
+	}
+
+	cfg.ConnectAll()
+
+	cfg.net.Reliable(!unreliable)
+
+	return cfg
+}
+
+package raftkv
+
+import (
+	"encoding/gob"
+	"labrpc"
+	"log"
+	"raft"
+	"sync"
+	"time"
+	"bytes"
+)
+
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	OpType	string
+	Args	interface{}
+}
+
+type Result struct {
+	opType	string
+	args  interface{}
+	reply interface{}
+}
+
+type RaftKV struct {
+	mu      sync.Mutex
+	me      int
+	rf      *raft.Raft
+	applyCh chan raft.ApplyMsg
+
+	maxraftstate int // snapshot if log grows this big
+
+	// Your definitions here.
+	database map[string]string		// for storing data
+	ack 	map[int64]int			// for recording requestId of every clients
+	messages map[int]chan Result	// for transferring result according to request
+	persister *raft.Persister
+}
+
+func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
+	index, _, isLeader := kv.rf.Start(Op{OpType: "Get", Args: *args})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+
+	kv.mu.Lock()
+	if _, ok := kv.messages[index]; !ok {
+		kv.messages[index] = make(chan Result, 1)
+
+	}
+	chanMsg := kv.messages[index]
+	kv.mu.Unlock()
+
+	select {
+	case msg := <- chanMsg:
+		if recArgs, ok := msg.args.(GetArgs); !ok {
+			reply.WrongLeader = true
+		} else {
+			if args.ClientId != recArgs.ClientId || args.RequestId != recArgs.RequestId {
+				reply.WrongLeader = true
+			} else {
+				*reply = msg.reply.(GetReply)
+				reply.WrongLeader = false
+			}
+		}
+	case <- time.After(time.Second * 1):
+		reply.WrongLeader = true
+	}
+}
+
+func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+	//DPrintf("PutAppend(): key[%s], value[%s]", args.Key, args.Value)
+	index, _, isLeader := kv.rf.Start(Op{OpType: "PutAppend", Args: *args})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+
+	kv.mu.Lock()
+	if _, ok := kv.messages[index]; !ok {
+		kv.messages[index] = make(chan Result, 1)
+
+	}
+	chanMsg := kv.messages[index]
+	kv.mu.Unlock()
+
+	select {
+	case msg := <- chanMsg:
+		if tmpArgs, ok := msg.args.(PutAppendArgs); !ok {
+			reply.WrongLeader = true
+		} else {
+			if args.ClientId != tmpArgs.ClientId || args.RequestId != tmpArgs.RequestId {
+				reply.WrongLeader = true
+			} else {
+				reply.Err = msg.reply.(PutAppendReply).Err
+				reply.WrongLeader = false
+			}
+		}
+	case <- time.After(time.Second * 1):
+		reply.WrongLeader = true
+	}
+}
+
+//
+// the tester calls Kill() when a RaftKV instance won't
+// be needed again. you are not required to do anything
+// in Kill(), but it might be convenient to (for example)
+// turn off debug output from this instance.
+//
+func (kv *RaftKV) Kill() {
+	kv.rf.Kill()
+	// Your code here, if desired.
+}
+
+//
+// servers[] contains the ports of the set of
+// servers that will cooperate via Raft to
+// form the fault-tolerant key/value service.
+// me is the index of the current server in servers[].
+// the k/v server should store snapshots with persister.SaveSnapshot(),
+// and Raft should save its state (including log) with persister.SaveRaftState().
+// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
+// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
+// you don't need to snapshot.
+//
+func  StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *RaftKV {
+	// call gob.Register on structures you want
+	// Go's RPC library to marshall/unmarshall.
+	gob.Register(Op{})
+	//!!! Register error!
+	gob.Register(PutAppendArgs{})
+	gob.Register(GetArgs{})
+	gob.Register(PutAppendReply{})
+	gob.Register(GetReply{})
+
+	kv := new(RaftKV)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+
+	// Your initialization code here.
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.database = make(map[string]string)
+	kv.ack = make(map[int64]int)
+	kv.messages = make(map[int]chan Result)
+
+	//!!! be careful of channel with 0 capacity
+	go kv.Update()
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	return kv
+}
+
+// ! added by Yang
+// receive command form raft to update database
+func (kv *RaftKV) Update() {
+	for true {
+		msg := <- kv.applyCh
+		if msg.UseSnapshot {
+			kv.UseSnapShot(msg.Snapshot)
+		} else {
+			request := msg.Command.(Op)
+			//!!! value and type is a type of variable
+			var result Result
+			var clientId int64
+			var requestId int
+			if request.OpType == "Get" {
+				args := request.Args.(GetArgs)
+				clientId = args.ClientId
+				requestId = args.RequestId
+				result.args = args
+			} else {
+				args := request.Args.(PutAppendArgs)
+				clientId = args.ClientId
+				requestId = args.RequestId
+				result.args = args
+			}
+			result.opType = request.OpType
+			//!!! even duplicated, the request have to be sent a reply
+			result.reply = kv.Apply(request, kv.IsDuplicated(clientId, requestId))
+			kv.SendResult(msg.Index, result)
+			kv.CheckSnapshot(msg.Index)
+		}
+	}
+}
+
+func (kv *RaftKV) UseSnapShot(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	var LastIncludedIndex int
+	var LastIncludedTerm int
+	kv.database = make(map[string]string)
+	kv.ack = make(map[int64]int)
+
+	r := bytes.NewBuffer(snapshot)
+	d := gob.NewDecoder(r)
+	d.Decode(&LastIncludedIndex)
+	d.Decode(&LastIncludedTerm)
+	d.Decode(&kv.database)
+	d.Decode(&kv.ack)
+}
+
+func (kv * RaftKV) CheckSnapshot(index int) {
+	if kv.maxraftstate != -1 && float64(kv.rf.GetPersistSize()) > float64(kv.maxraftstate)*0.8 {
+		w := new(bytes.Buffer)
+		e := gob.NewEncoder(w)
+		e.Encode(kv.database)
+		e.Encode(kv.ack)
+		data := w.Bytes()
+		go kv.rf.StartSnapshot(data, index)
+	}
+}
+
+func (kv *RaftKV) SendResult(index int, result Result) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, ok := kv.messages[index]; !ok {
+		kv.messages[index] = make(chan Result, 1)
+	} else {
+		select {
+		case <- kv.messages[index]:
+		default:
+		}
+	}
+	kv.messages[index] <- result
+}
+
+
+func (kv *RaftKV) Apply(request Op, isDuplicated bool) interface{} {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	switch request.Args.(type) {
+	case GetArgs:
+		var reply GetReply
+		args := request.Args.(GetArgs)
+		if value, ok := kv.database[args.Key]; ok {
+			reply.Err = OK
+			reply.Value = value
+		} else {
+			reply.Err = ErrNoKey
+		}
+		//DPrintf("[%d] Apply get request: [%d]", kv.me, args.RequestId)
+		return reply
+	case PutAppendArgs:
+		var reply PutAppendReply
+		args := request.Args.(PutAppendArgs)
+		//!!! attention of the operated variable
+		if !isDuplicated {
+			if args.Op == "Put" {
+				kv.database[args.Key] = args.Value
+			} else {
+				kv.database[args.Key] += args.Value
+			}
+		}
+		reply.Err = OK
+		//DPrintf("[%d] Apply putappend request: [%d]", kv.me, args.RequestId)
+		return reply
+	}
+	return nil
+}
+
+func (kv *RaftKV) IsDuplicated(clientId int64, requestId int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if value, ok := kv.ack[clientId]; ok && value >= requestId {
+		return true
+	}
+	kv.ack[clientId] = requestId
+	return false
+}
+
+package raftkv
+
+import "testing"
+import "strconv"
+import "time"
+import "fmt"
+import "math/rand"
+import "log"
+import "strings"
+import "sync/atomic"
+
+// The tester generously allows solutions to complete elections in one second
+// (much more than the paper's range of timeouts).
+const electionTimeout = 1 * time.Second
+
+func check(t *testing.T, ck *Clerk, key string, value string) {
+	v := ck.Get(key)
+	if v != value {
+		t.Fatalf("Get(%v): expected:\n%v\nreceived:\n%v", key, value, v)
+	}
+}
+
+// a client runs the function f and then signals it is done
+func run_client(t *testing.T, cfg *config, me int, ca chan bool, fn func(me int, ck *Clerk, t *testing.T)) {
+	ok := false
+	defer func() { ca <- ok }()
+	ck := cfg.makeClient(cfg.All())
+	fn(me, ck, t)
+	ok = true
+	cfg.deleteClient(ck)
+}
+
+// spawn ncli clients and wait until they are all done
+func spawn_clients_and_wait(t *testing.T, cfg *config, ncli int, fn func(me int, ck *Clerk, t *testing.T)) {
+	ca := make([]chan bool, ncli)
+	for cli := 0; cli < ncli; cli++ {
+		ca[cli] = make(chan bool)
+		go run_client(t, cfg, cli, ca[cli], fn)
+	}
+	// log.Printf("spawn_clients_and_wait: waiting for clients")
+	for cli := 0; cli < ncli; cli++ {
+		ok := <-ca[cli]
+		// log.Printf("spawn_clients_and_wait: client %d is done\n", cli)
+		if ok == false {
+			t.Fatalf("failure")
+		}
+	}
+}
+
+// predict effect of Append(k, val) if old value is prev.
+func NextValue(prev string, val string) string {
+	return prev + val
+}
+
+// check that for a specific client all known appends are present in a value,
+// and in order
+func checkClntAppends(t *testing.T, clnt int, v string, count int) {
+	lastoff := -1
+	for j := 0; j < count; j++ {
+		wanted := "x " + strconv.Itoa(clnt) + " " + strconv.Itoa(j) + " y"
+		off := strings.Index(v, wanted)
+		if off < 0 {
+			t.Fatalf("%v missing element %v in Append result %v", clnt, wanted, v)
+		}
+		off1 := strings.LastIndex(v, wanted)
+		if off1 != off {
+			fmt.Printf("off1 %v off %v\n", off1, off)
+			t.Fatalf("duplicate element %v in Append result", wanted)
+		}
+		if off <= lastoff {
+			t.Fatalf("wrong order for element %v in Append result", wanted)
+		}
+		lastoff = off
+	}
+}
+
+// check that all known appends are present in a value,
+// and are in order for each concurrent client.
+func checkConcurrentAppends(t *testing.T, v string, counts []int) {
+	nclients := len(counts)
+	for i := 0; i < nclients; i++ {
+		lastoff := -1
+		for j := 0; j < counts[i]; j++ {
+			wanted := "x " + strconv.Itoa(i) + " " + strconv.Itoa(j) + " y"
+			off := strings.Index(v, wanted)
+			if off < 0 {
+				t.Fatalf("%v missing element %v in Append result %v", i, wanted, v)
+			}
+			off1 := strings.LastIndex(v, wanted)
+			if off1 != off {
+				t.Fatalf("duplicate element %v in Append result", wanted)
+			}
+			if off <= lastoff {
+				t.Fatalf("wrong order for element %v in Append result", wanted)
+			}
+			lastoff = off
+		}
+	}
+}
+
+// repartition the servers periodically
+func partitioner(t *testing.T, cfg *config, ch chan bool, done *int32) {
+	defer func() { ch <- true }()
+	for atomic.LoadInt32(done) == 0 {
+		a := make([]int, cfg.n)
+		for i := 0; i < cfg.n; i++ {
+			a[i] = (rand.Int() % 2)
+		}
+		pa := make([][]int, 2)
+		for i := 0; i < 2; i++ {
+			pa[i] = make([]int, 0)
+			for j := 0; j < cfg.n; j++ {
+				if a[j] == i {
+					pa[i] = append(pa[i], j)
+				}
+			}
+		}
+		cfg.partition(pa[0], pa[1])
+		time.Sleep(electionTimeout + time.Duration(rand.Int63()%200)*time.Millisecond)
+	}
+}
+
+// Basic test is as follows: one or more clients submitting Append/Get
+// operations to set of servers for some period of time.  After the period is
+// over, test checks that all appended values are present and in order for a
+// particular key.  If unreliable is set, RPCs may fail.  If crash is set, the
+// servers crash after the period is over and restart.  If partitions is set,
+// the test repartitions the network concurrently with the clients and servers. If
+// maxraftstate is a positive number, the size of the state for Raft (i.e., log
+// size) shouldn't exceed 2*maxraftstate.
+func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash bool, partitions bool, maxraftstate int) {
+	const nservers = 5
+	cfg := make_config(t, tag, nservers, unreliable, maxraftstate)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient(cfg.All())
+
+	done_partitioner := int32(0)
+	done_clients := int32(0)
+	ch_partitioner := make(chan bool)
+	clnts := make([]chan int, nclients)
+	for i := 0; i < nclients; i++ {
+		clnts[i] = make(chan int)
+	}
+	for i := 0; i < 3; i++ {
+		// log.Printf("Iteration %v\n", i)
+		atomic.StoreInt32(&done_clients, 0)
+		atomic.StoreInt32(&done_partitioner, 0)
+		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
+			j := 0
+			defer func() {
+				clnts[cli] <- j
+			}()
+			last := ""
+			key := strconv.Itoa(cli)
+			myck.Put(key, last)
+			for atomic.LoadInt32(&done_clients) == 0 {
+				if (rand.Int() % 1000) < 500 {
+					nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
+					// log.Printf("%d: client new append %v\n", cli, nv)
+					myck.Append(key, nv)
+					last = NextValue(last, nv)
+					j++
+				} else {
+					// log.Printf("%d: client new get %v\n", cli, key)
+					v := myck.Get(key)
+					if v != last {
+						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+					}
+				}
+			}
+		})
+
+		if partitions {
+			// Allow the clients to perform some operations without interruption
+			time.Sleep(1 * time.Second)
+			go partitioner(t, cfg, ch_partitioner, &done_partitioner)
+		}
+		time.Sleep(5 * time.Second)
+
+		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
+		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
+
+		if partitions {
+			// log.Printf("wait for partitioner\n")
+			<-ch_partitioner
+			// reconnect network and submit a request. A client may
+			// have submitted a request in a minority.  That request
+			// won't return until that server discovers a new term
+			// has started.
+			cfg.ConnectAll()
+			// wait for a while so that we have a new term
+			time.Sleep(electionTimeout)
+		}
+
+		if crash {
+			for i := 0; i < nservers; i++ {
+				log.Printf("shutdown server [%d]\n", i)
+				cfg.ShutdownServer(i)
+			}
+			// Wait for a while for servers to shutdown, since
+			// shutdown isn't a real crash and isn't instantaneous
+			time.Sleep(electionTimeout)
+			// crash and re-start all
+			for i := 0; i < nservers; i++ {
+				log.Printf("start server [%d]\n", i)
+				cfg.StartServer(i)
+			}
+			cfg.ConnectAll()
+		}
+
+		log.Printf("wait for clients\n")
+		for i := 0; i < nclients; i++ {
+			// log.Printf("read from clients %d\n", i)
+			j := <-clnts[i]
+			if j < 10 {
+				log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
+			}
+			key := strconv.Itoa(i)
+			// log.Printf("Check %v for client %d\n", j, i)
+			v := ck.Get(key)
+			checkClntAppends(t, i, v, j)
+		}
+
+		if maxraftstate > 0 {
+			// Check maximum after the servers have processed all client
+			// requests and had time to checkpoint
+			if cfg.LogSize() > 2*maxraftstate {
+				t.Fatalf("logs were not trimmed (%v > 2*%v)", cfg.LogSize(), maxraftstate)
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestBasic(t *testing.T) {
+	fmt.Printf("Test: One client ...\n")
+	GenericTest(t, "basic", 1, false, false, false, -1)
+}
+
+func TestConcurrent(t *testing.T) {
+	fmt.Printf("Test: concurrent clients ...\n")
+	GenericTest(t, "concur", 5, false, false, false, -1)
+}
+
+func TestUnreliable(t *testing.T) {
+	fmt.Printf("Test: unreliable ...\n")
+	GenericTest(t, "unreliable", 5, true, false, false, -1)
+}
+
+func TestUnreliableOneKey(t *testing.T) {
+	const nservers = 3
+	cfg := make_config(t, "onekey", nservers, true, -1)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient(cfg.All())
+
+	fmt.Printf("Test: Concurrent Append to same key, unreliable ...\n")
+
+	ck.Put("k", "")
+
+	const nclient = 5
+	const upto = 10
+	spawn_clients_and_wait(t, cfg, nclient, func(me int, myck *Clerk, t *testing.T) {
+		n := 0
+		for n < upto {
+			myck.Append("k", "x "+strconv.Itoa(me)+" "+strconv.Itoa(n)+" y")
+			n++
+		}
+	})
+
+	var counts []int
+	for i := 0; i < nclient; i++ {
+		counts = append(counts, upto)
+	}
+
+	vx := ck.Get("k")
+	checkConcurrentAppends(t, vx, counts)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+// Submit a request in the minority partition and check that the requests
+// doesn't go through until the partition heals.  The leader in the original
+// network ends up in the minority partition.
+func TestOnePartition(t *testing.T) {
+	const nservers = 5
+	cfg := make_config(t, "partition", nservers, false, -1)
+	defer cfg.cleanup()
+	ck := cfg.makeClient(cfg.All())
+
+	ck.Put("1", "13")
+
+	fmt.Printf("Test: Progress in majority ...\n")
+
+	p1, p2 := cfg.make_partition()
+	cfg.partition(p1, p2)
+
+	ckp1 := cfg.makeClient(p1)  // connect ckp1 to p1
+	ckp2a := cfg.makeClient(p2) // connect ckp2a to p2
+	ckp2b := cfg.makeClient(p2) // connect ckp2b to p2
+
+	ckp1.Put("1", "14")
+	check(t, ckp1, "1", "14")
+
+	fmt.Printf("  ... Passed\n")
+
+	done0 := make(chan bool)
+	done1 := make(chan bool)
+
+	fmt.Printf("Test: No progress in minority ...\n")
+	go func() {
+		ckp2a.Put("1", "15")
+		done0 <- true
+	}()
+	go func() {
+		ckp2b.Get("1") // different clerk in p2
+		done1 <- true
+	}()
+
+	select {
+	case <-done0:
+		t.Fatalf("Put in minority completed")
+	case <-done1:
+		t.Fatalf("Get in minority completed")
+	case <-time.After(time.Second):
+	}
+
+	check(t, ckp1, "1", "14")
+	ckp1.Put("1", "16")
+	check(t, ckp1, "1", "16")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Completion after heal ...\n")
+
+	cfg.ConnectAll()
+	cfg.ConnectClient(ckp2a, cfg.All())
+	cfg.ConnectClient(ckp2b, cfg.All())
+
+	time.Sleep(electionTimeout)
+
+	select {
+	case <-done0:
+	case <-time.After(30 * 100 * time.Millisecond):
+		t.Fatalf("Put did not complete")
+	}
+
+	select {
+	case <-done1:
+	case <-time.After(30 * 100 * time.Millisecond):
+		t.Fatalf("Get did not complete")
+	default:
+	}
+
+	check(t, ck, "1", "15")
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestManyPartitionsOneClient(t *testing.T) {
+	fmt.Printf("Test: many partitions ...\n")
+	GenericTest(t, "manypartitions", 1, false, false, true, -1)
+}
+
+func TestManyPartitionsManyClients(t *testing.T) {
+	fmt.Printf("Test: many partitions, many clients ...\n")
+	GenericTest(t, "manypartitionsclnts", 5, false, false, true, -1)
+}
+
+func TestPersistOneClient(t *testing.T) {
+	fmt.Printf("Test: persistence with one client ...\n")
+	GenericTest(t, "persistone", 1, false, true, false, -1)
+}
+
+func TestPersistConcurrent(t *testing.T) {
+	fmt.Printf("Test: persistence with concurrent clients ...\n")
+	GenericTest(t, "persistconcur", 5, false, true, false, -1)
+}
+
+func TestPersistConcurrentUnreliable(t *testing.T) {
+	fmt.Printf("Test: persistence with concurrent clients, unreliable ...\n")
+	GenericTest(t, "persistconcurunreliable", 5, true, true, false, -1)
+}
+
+func TestPersistPartition(t *testing.T) {
+	fmt.Printf("Test: persistence with concurrent clients and repartitioning servers...\n")
+	GenericTest(t, "persistpart", 5, false, true, true, -1)
+}
+
+func TestPersistPartitionUnreliable(t *testing.T) {
+	fmt.Printf("Test: persistence with concurrent clients and repartitioning servers, unreliable...\n")
+	GenericTest(t, "persistpartunreliable", 5, true, true, true, -1)
+}
+
+//
+// if one server falls behind, then rejoins, does it
+// recover by using the InstallSnapshot RPC?
+// also checks that majority discards committed log entries
+// even if minority doesn't respond.
+//
+func TestSnapshotRPC(t *testing.T) {
+	const nservers = 3
+	maxraftstate := 1000
+	cfg := make_config(t, "snapshotrpc", nservers, false, maxraftstate)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient(cfg.All())
+
+	fmt.Printf("Test: InstallSnapshot RPC ...\n")
+
+	ck.Put("a", "A")
+	check(t, ck, "a", "A")
+
+	// a bunch of puts into the majority partition.
+	cfg.partition([]int{0, 1}, []int{2})
+	{
+		ck1 := cfg.makeClient([]int{0, 1})
+		for i := 0; i < 50; i++ {
+			ck1.Put(strconv.Itoa(i), strconv.Itoa(i))
+		}
+		time.Sleep(electionTimeout)
+		ck1.Put("b", "B")
+	}
+
+	// check that the majority partition has thrown away
+	// most of its log entries.
+	if cfg.LogSize() > 2*maxraftstate {
+		t.Fatalf("logs were not trimmed (%v > 2*%v)", cfg.LogSize(), maxraftstate)
+	}
+
+	// now make group that requires participation of
+	// lagging server, so that it has to catch up.
+	cfg.partition([]int{0, 2}, []int{1})
+	{
+		ck1 := cfg.makeClient([]int{0, 2})
+		ck1.Put("c", "C")
+		ck1.Put("d", "D")
+		check(t, ck1, "a", "A")
+		check(t, ck1, "b", "B")
+		check(t, ck1, "1", "1")
+		check(t, ck1, "49", "49")
+	}
+
+	// now everybody
+	cfg.partition([]int{0, 1, 2}, []int{})
+
+	ck.Put("e", "E")
+	check(t, ck, "c", "C")
+	check(t, ck, "e", "E")
+	check(t, ck, "1", "1")
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestSnapshotRecover(t *testing.T) {
+	fmt.Printf("Test: persistence with one client and snapshots ...\n")
+	GenericTest(t, "snapshot", 1, false, true, false, 1000)
+}
+
+func TestSnapshotRecoverManyClients(t *testing.T) {
+	fmt.Printf("Test: persistence with several clients and snapshots ...\n")
+	GenericTest(t, "snapshotunreliable", 20, false, true, false, 1000)
+}
+
+func TestSnapshotUnreliable(t *testing.T) {
+	fmt.Printf("Test: persistence with several clients, snapshots, unreliable ...\n")
+	GenericTest(t, "snapshotunreliable", 5, true, false, false, 1000)
+}
+
+func TestSnapshotUnreliableRecover(t *testing.T) {
+	fmt.Printf("Test: persistence with several clients, failures, and snapshots, unreliable ...\n")
+	GenericTest(t, "snapshotunreliablecrash", 5, true, true, false, 1000)
+}
+
+func TestSnapshotUnreliableRecoverConcurrentPartition(t *testing.T) {
+	fmt.Printf("Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...\n")
+	GenericTest(t, "snapshotunreliableconcurpartitions", 5, true, true, true, 1000)
+}
+
+package shardkv
+
+import "shardmaster"
+import "net/rpc"
+import "time"
+import "sync"
+import "fmt"
+import "crypto/rand"
+import "math/big"
+
+type Clerk struct {
+	mu     sync.Mutex // one RPC at a time
+	sm     *shardmaster.Clerk
+	config shardmaster.Config
+	// You'll have to modify Clerk.
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
+func MakeClerk(shardmasters []string) *Clerk {
+	ck := new(Clerk)
+	ck.sm = shardmaster.MakeClerk(shardmasters)
+	// You'll have to modify MakeClerk.
+	return ck
+}
+
+//
+// call() sends an RPC to the rpcname handler on server srv
+// with arguments args, waits for the reply, and leaves the
+// reply in reply. the reply argument should be a pointer
+// to a reply structure.
+//
+// the return value is true if the server responded, and false
+// if call() was not able to contact the server. in particular,
+// the reply's contents are only valid if call() returned true.
+//
+// you should assume that call() will return an
+// error after a while if the server is dead.
+// don't provide your own time-out mechanism.
+//
+// please use call() to send all RPCs, in client.go and server.go.
+// please don't change this function.
+//
+func call(srv string, rpcname string,
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
+}
+
+//
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+//
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardmaster.NShards
+	return shard
+}
+
+//
+// fetch the current value for a key.
+// returns "" if the key does not exist.
+// keeps trying forever in the face of all other errors.
+//
+func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	// You'll have to modify Get().
+
+	for {
+		shard := key2shard(key)
+
+		gid := ck.config.Shards[shard]
+
+		servers, ok := ck.config.Groups[gid]
+
+		if ok {
+			// try each server in the shard's replication group.
+			for _, srv := range servers {
+				args := &GetArgs{}
+				args.Key = key
+				var reply GetReply
+				ok := call(srv, "ShardKV.Get", args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					return reply.Value
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+}
+
+// send a Put or Append request.
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	// You'll have to modify PutAppend().
+
+	for {
+		shard := key2shard(key)
+
+		gid := ck.config.Shards[shard]
+
+		servers, ok := ck.config.Groups[gid]
+
+		if ok {
+			// try each server in the shard's replication group.
+			for _, srv := range servers {
+				args := &PutAppendArgs{}
+				args.Key = key
+				args.Value = value
+				args.Op = op
+				var reply PutAppendReply
+				ok := call(srv, "ShardKV.PutAppend", args, &reply)
+				if ok && reply.Err == OK {
+					return
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+}
+
+func (ck *Clerk) Put(key string, value string) {
+	ck.PutAppend(key, value, "Put")
+}
+func (ck *Clerk) Append(key string, value string) {
+	ck.PutAppend(key, value, "Append")
+}
+
+package shardkv
+
+//
+// Sharded key/value server.
+// Lots of replica groups, each running op-at-a-time paxos.
+// Shardmaster decides which group serves each shard.
+// Shardmaster may change shard assignment from time to time.
+//
+// You will have to modify these definitions.
+//
+
+const (
+	OK            = "OK"
+	ErrNoKey      = "ErrNoKey"
+	ErrWrongGroup = "ErrWrongGroup"
+)
+
+type Err string
+
+type PutAppendArgs struct {
+	Key   string
+	Value string
+	Op    string // "Put" or "Append"
+	// You'll have to add definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+
+}
+
+type PutAppendReply struct {
+	Err Err
+}
+
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+}
+
+type GetReply struct {
+	Err   Err
+	Value string
+}
+
+package shardkv
+
+import "net"
+import "fmt"
+import "net/rpc"
+import "log"
+import "time"
+import "paxos"
+import "sync"
+import "sync/atomic"
+import "os"
+import "syscall"
+import "encoding/gob"
+import "math/rand"
+import "shardmaster"
+
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+
+type Op struct {
+	// Your definitions here.
+}
+
+
+type ShardKV struct {
+	mu         sync.Mutex
+	l          net.Listener
+	me         int
+	dead       int32 // for testing
+	unreliable int32 // for testing
+	sm         *shardmaster.Clerk
+	px         *paxos.Paxos
+
+	gid int64 // my replica group ID
+
+	// Your definitions here.
+}
+
+
+func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
+	// Your code here.
+	return nil
+}
+
+// RPC handler for client Put and Append requests
+func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	// Your code here.
+	return nil
+}
+
+//
+// Ask the shardmaster if there's a new configuration;
+// if so, re-configure.
+//
+func (kv *ShardKV) tick() {
+}
+
+// tell the server to shut itself down.
+// please don't change these two functions.
+func (kv *ShardKV) kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.l.Close()
+	kv.px.Kill()
+}
+
+// call this to find out if the server is dead.
+func (kv *ShardKV) isdead() bool {
+	return atomic.LoadInt32(&kv.dead) != 0
+}
+
+// please do not change these two functions.
+func (kv *ShardKV) Setunreliable(what bool) {
+	if what {
+		atomic.StoreInt32(&kv.unreliable, 1)
+	} else {
+		atomic.StoreInt32(&kv.unreliable, 0)
+	}
+}
+
+func (kv *ShardKV) isunreliable() bool {
+	return atomic.LoadInt32(&kv.unreliable) != 0
+}
+
+//
+// Start a shardkv server.
+// gid is the ID of the server's replica group.
+// shardmasters[] contains the ports of the
+//   servers that implement the shardmaster.
+// servers[] contains the ports of the servers
+//   in this replica group.
+// Me is the index of this server in servers[].
+//
+func StartServer(gid int64, shardmasters []string,
+	servers []string, me int) *ShardKV {
+	gob.Register(Op{})
+
+	kv := new(ShardKV)
+	kv.me = me
+	kv.gid = gid
+	kv.sm = shardmaster.MakeClerk(shardmasters)
+
+	// Your initialization code here.
+	// Don't call Join().
+
+	rpcs := rpc.NewServer()
+	rpcs.Register(kv)
+
+	kv.px = paxos.Make(servers, me, rpcs)
+
+
+	os.Remove(servers[me])
+	l, e := net.Listen("unix", servers[me])
+	if e != nil {
+		log.Fatal("listen error: ", e)
+	}
+	kv.l = l
+
+	// please do not change any of the following code,
+	// or do anything to subvert it.
+
+	go func() {
+		for kv.isdead() == false {
+			conn, err := kv.l.Accept()
+			if err == nil && kv.isdead() == false {
+				if kv.isunreliable() && (rand.Int63()%1000) < 100 {
+					// discard the request.
+					conn.Close()
+				} else if kv.isunreliable() && (rand.Int63()%1000) < 200 {
+					// process the request but force discard of reply.
+					c1 := conn.(*net.UnixConn)
+					f, _ := c1.File()
+					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+					if err != nil {
+						fmt.Printf("shutdown: %v\n", err)
+					}
+					go rpcs.ServeConn(conn)
+				} else {
+					go rpcs.ServeConn(conn)
+				}
+			} else if err == nil {
+				conn.Close()
+			}
+			if err != nil && kv.isdead() == false {
+				fmt.Printf("ShardKV(%v) accept: %v\n", me, err.Error())
+				kv.kill()
+			}
+		}
+	}()
+
+	go func() {
+		for kv.isdead() == false {
+			kv.tick()
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	return kv
+}
+
+package shardkv
+
+import "testing"
+import "shardmaster"
+import "runtime"
+import "strconv"
+import "os"
+import "time"
+import "fmt"
+import "sync"
+import "sync/atomic"
+import "math/rand"
+
+// information about the servers of one replica group.
+type tGroup struct {
+	gid     int64
+	servers []*ShardKV
+	ports   []string
+}
+
+// information about all the servers of a k/v cluster.
+type tCluster struct {
+	t           *testing.T
+	masters     []*shardmaster.ShardMaster
+	mck         *shardmaster.Clerk
+	masterports []string
+	groups      []*tGroup
+}
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "skv-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+//
+// start a k/v replica server thread.
+//
+func (tc *tCluster) start1(gi int, si int, unreliable bool) {
+	s := StartServer(tc.groups[gi].gid, tc.masterports, tc.groups[gi].ports, si)
+	tc.groups[gi].servers[si] = s
+	s.Setunreliable(unreliable)
+}
+
+func (tc *tCluster) cleanup() {
+	for gi := 0; gi < len(tc.groups); gi++ {
+		g := tc.groups[gi]
+		for si := 0; si < len(g.servers); si++ {
+			if g.servers[si] != nil {
+				g.servers[si].kill()
+			}
+		}
+	}
+
+	for i := 0; i < len(tc.masters); i++ {
+		if tc.masters[i] != nil {
+			tc.masters[i].Kill()
+		}
+	}
+}
+
+func (tc *tCluster) shardclerk() *shardmaster.Clerk {
+	return shardmaster.MakeClerk(tc.masterports)
+}
+
+func (tc *tCluster) clerk() *Clerk {
+	return MakeClerk(tc.masterports)
+}
+
+func (tc *tCluster) join(gi int) {
+	tc.mck.Join(tc.groups[gi].gid, tc.groups[gi].ports)
+}
+
+func (tc *tCluster) leave(gi int) {
+	tc.mck.Leave(tc.groups[gi].gid)
+}
+
+func setup(t *testing.T, tag string, unreliable bool) *tCluster {
+	runtime.GOMAXPROCS(4)
+
+	const nmasters = 3
+	const ngroups = 3   // replica groups
+	const nreplicas = 3 // servers per group
+
+	tc := &tCluster{}
+	tc.t = t
+	tc.masters = make([]*shardmaster.ShardMaster, nmasters)
+	tc.masterports = make([]string, nmasters)
+
+	for i := 0; i < nmasters; i++ {
+		tc.masterports[i] = port(tag+"m", i)
+	}
+	for i := 0; i < nmasters; i++ {
+		tc.masters[i] = shardmaster.StartServer(tc.masterports, i)
+	}
+	tc.mck = tc.shardclerk()
+
+	tc.groups = make([]*tGroup, ngroups)
+
+	for i := 0; i < ngroups; i++ {
+		tc.groups[i] = &tGroup{}
+		tc.groups[i].gid = int64(i + 100)
+		tc.groups[i].servers = make([]*ShardKV, nreplicas)
+		tc.groups[i].ports = make([]string, nreplicas)
+		for j := 0; j < nreplicas; j++ {
+			tc.groups[i].ports[j] = port(tag+"s", (i*nreplicas)+j)
+		}
+		for j := 0; j < nreplicas; j++ {
+			tc.start1(i, j, unreliable)
+		}
+	}
+
+	// return smh, gids, ha, sa, clean
+	return tc
+}
+
+func TestBasic(t *testing.T) {
+	tc := setup(t, "basic", false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Basic Join/Leave ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	ck.Put("a", "x")
+	ck.Append("a", "b")
+	if ck.Get("a") != "xb" {
+		t.Fatalf("Get got wrong value")
+	}
+
+	keys := make([]string, 10)
+	vals := make([]string, len(keys))
+	for i := 0; i < len(keys); i++ {
+		keys[i] = strconv.Itoa(rand.Int())
+		vals[i] = strconv.Itoa(rand.Int())
+		ck.Put(keys[i], vals[i])
+	}
+
+	// are keys still there after joins?
+	for g := 1; g < len(tc.groups); g++ {
+		tc.join(g)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("joining; wrong value; g=%v k=%v wanted=%v got=%v",
+					g, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	// are keys still there after leaves?
+	for g := 0; g < len(tc.groups)-1; g++ {
+		tc.leave(g)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("leaving; wrong value; g=%v k=%v wanted=%v got=%v",
+					g, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestMove(t *testing.T) {
+	tc := setup(t, "move", false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Shards really move ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	// insert one key per shard
+	for i := 0; i < shardmaster.NShards; i++ {
+		ck.Put(string('0'+i), string('0'+i))
+	}
+
+	// add group 1.
+	tc.join(1)
+	time.Sleep(5 * time.Second)
+
+	// check that keys are still there.
+	for i := 0; i < shardmaster.NShards; i++ {
+		if ck.Get(string('0'+i)) != string('0'+i) {
+			t.Fatalf("missing key/value")
+		}
+	}
+
+	// remove sockets from group 0.
+	for _, port := range tc.groups[0].ports {
+		os.Remove(port)
+	}
+
+	count := int32(0)
+	var mu sync.Mutex
+	for i := 0; i < shardmaster.NShards; i++ {
+		go func(me int) {
+			myck := tc.clerk()
+			v := myck.Get(string('0' + me))
+			if v == string('0'+me) {
+				mu.Lock()
+				atomic.AddInt32(&count, 1)
+				mu.Unlock()
+			} else {
+				t.Fatalf("Get(%v) yielded %v\n", me, v)
+			}
+		}(i)
+	}
+
+	time.Sleep(10 * time.Second)
+
+	ccc := atomic.LoadInt32(&count)
+	if ccc > shardmaster.NShards/3 && ccc < 2*(shardmaster.NShards/3) {
+		fmt.Printf("  ... Passed\n")
+	} else {
+		t.Fatalf("%v keys worked after killing 1/2 of groups; wanted %v",
+			ccc, shardmaster.NShards/2)
+	}
+}
+
+func TestLimp(t *testing.T) {
+	tc := setup(t, "limp", false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Reconfiguration with some dead replicas ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	ck.Put("a", "b")
+	if ck.Get("a") != "b" {
+		t.Fatalf("got wrong value")
+	}
+
+	// kill one server from each replica group.
+	for gi := 0; gi < len(tc.groups); gi++ {
+		sa := tc.groups[gi].servers
+		ns := len(sa)
+		sa[rand.Int()%ns].kill()
+	}
+
+	keys := make([]string, 10)
+	vals := make([]string, len(keys))
+	for i := 0; i < len(keys); i++ {
+		keys[i] = strconv.Itoa(rand.Int())
+		vals[i] = strconv.Itoa(rand.Int())
+		ck.Put(keys[i], vals[i])
+	}
+
+	// are keys still there after joins?
+	for g := 1; g < len(tc.groups); g++ {
+		tc.join(g)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("joining; wrong value; g=%v k=%v wanted=%v got=%v",
+					g, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	// are keys still there after leaves?
+	for gi := 0; gi < len(tc.groups)-1; gi++ {
+		tc.leave(gi)
+		time.Sleep(2 * time.Second)
+		g := tc.groups[gi]
+		for i := 0; i < len(g.servers); i++ {
+			g.servers[i].kill()
+		}
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("leaving; wrong value; g=%v k=%v wanted=%v got=%v",
+					g, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func doConcurrent(t *testing.T, unreliable bool) {
+	tc := setup(t, "concurrent-"+strconv.FormatBool(unreliable), unreliable)
+	defer tc.cleanup()
+
+	for i := 0; i < len(tc.groups); i++ {
+		tc.join(i)
+	}
+
+	const npara = 11
+	var ca [npara]chan bool
+	for i := 0; i < npara; i++ {
+		ca[i] = make(chan bool)
+		go func(me int) {
+			ok := true
+			defer func() { ca[me] <- ok }()
+			ck := tc.clerk()
+			mymck := tc.shardclerk()
+			key := strconv.Itoa(me)
+			last := ""
+			for iters := 0; iters < 3; iters++ {
+				nv := strconv.Itoa(rand.Int())
+				ck.Append(key, nv)
+				last = last + nv
+				v := ck.Get(key)
+				if v != last {
+					ok = false
+					t.Fatalf("Get(%v) expected %v got %v\n", key, last, v)
+				}
+
+				gi := rand.Int() % len(tc.groups)
+				gid := tc.groups[gi].gid
+				mymck.Move(rand.Int()%shardmaster.NShards, gid)
+
+				time.Sleep(time.Duration(rand.Int()%30) * time.Millisecond)
+			}
+		}(i)
+	}
+
+	for i := 0; i < npara; i++ {
+		x := <-ca[i]
+		if x == false {
+			t.Fatalf("something is wrong")
+		}
+	}
+}
+
+func TestConcurrent(t *testing.T) {
+	fmt.Printf("Test: Concurrent Put/Get/Move ...\n")
+	doConcurrent(t, false)
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestConcurrentUnreliable(t *testing.T) {
+	fmt.Printf("Test: Concurrent Put/Get/Move (unreliable) ...\n")
+	doConcurrent(t, true)
+	fmt.Printf("  ... Passed\n")
+}
+
+package shardmaster
+
+//
+// Shardmaster clerk.
+// Please don't change this file.
+//
+
+import "net/rpc"
+import "time"
+import "fmt"
+
+type Clerk struct {
+	servers []string // shardmaster replicas
+}
+
+func MakeClerk(servers []string) *Clerk {
+	ck := new(Clerk)
+	ck.servers = servers
+	return ck
+}
+
+//
+// call() sends an RPC to the rpcname handler on server srv
+// with arguments args, waits for the reply, and leaves the
+// reply in reply. the reply argument should be a pointer
+// to a reply structure.
+//
+// the return value is true if the server responded, and false
+// if call() was not able to contact the server. in particular,
+// the reply's contents are only valid if call() returned true.
+//
+// you should assume that call() will return an
+// error after a while if the server is dead.
+// don't provide your own time-out mechanism.
+//
+// please use call() to send all RPCs, in client.go and server.go.
+// please don't change this function.
+//
+func call(srv string, rpcname string,
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
+}
+
+func (ck *Clerk) Query(num int) Config {
+	for {
+		// try each known server.
+		for _, srv := range ck.servers {
+			args := &QueryArgs{}
+			args.Num = num
+			var reply QueryReply
+			ok := call(srv, "ShardMaster.Query", args, &reply)
+			if ok {
+				return reply.Config
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) Join(gid int64, servers []string) {
+	for {
+		// try each known server.
+		for _, srv := range ck.servers {
+			args := &JoinArgs{}
+			args.GID = gid
+			args.Servers = servers
+			var reply JoinReply
+			ok := call(srv, "ShardMaster.Join", args, &reply)
+			if ok {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) Leave(gid int64) {
+	for {
+		// try each known server.
+		for _, srv := range ck.servers {
+			args := &LeaveArgs{}
+			args.GID = gid
+			var reply LeaveReply
+			ok := call(srv, "ShardMaster.Leave", args, &reply)
+			if ok {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) Move(shard int, gid int64) {
+	for {
+		// try each known server.
+		for _, srv := range ck.servers {
+			args := &MoveArgs{}
+			args.Shard = shard
+			args.GID = gid
+			var reply MoveReply
+			ok := call(srv, "ShardMaster.Move", args, &reply)
+			if ok {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+package shardmaster
+
+//
+// Master shard server: assigns shards to replication groups.
+//
+// RPC interface:
+// Join(gid, servers) -- replica group gid is joining, give it some shards.
+// Leave(gid) -- replica group gid is retiring, hand off all its shards.
+// Move(shard, gid) -- hand off one shard from current owner to gid.
+// Query(num) -> fetch Config # num, or latest config if num==-1.
+//
+// A Config (configuration) describes a set of replica groups, and the
+// replica group responsible for each shard. Configs are numbered. Config
+// #0 is the initial configuration, with no groups and all shards
+// assigned to group 0 (the invalid group).
+//
+// A GID is a replica group ID. GIDs must be uniqe and > 0.
+// Once a GID joins, and leaves, it should never join again.
+//
+// Please don't change this file.
+//
+
+const NShards = 10
+
+type Config struct {
+	Num    int                // config number
+	Shards [NShards]int64     // shard -> gid
+	Groups map[int64][]string // gid -> servers[]
+}
+
+type JoinArgs struct {
+	GID     int64    // unique replica group ID
+	Servers []string // group server ports
+}
+
+type JoinReply struct {
+}
+
+type LeaveArgs struct {
+	GID int64
+}
+
+type LeaveReply struct {
+}
+
+type MoveArgs struct {
+	Shard int
+	GID   int64
+}
+
+type MoveReply struct {
+}
+
+type QueryArgs struct {
+	Num int // desired config number
+}
+
+type QueryReply struct {
+	Config Config
+}
+
+package shardmaster
+
+import "net"
+import "fmt"
+import "net/rpc"
+import "log"
+
+import "paxos"
+import "sync"
+import "sync/atomic"
+import "os"
+import "syscall"
+import "encoding/gob"
+import "math/rand"
+
+type ShardMaster struct {
+	mu         sync.Mutex
+	l          net.Listener
+	me         int
+	dead       int32 // for testing
+	unreliable int32 // for testing
+	px         *paxos.Paxos
+
+	configs []Config // indexed by config num
+}
+
+
+type Op struct {
+	// Your data here.
+}
+
+
+func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
+	// Your code here.
+
+	return nil
+}
+
+func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) error {
+	// Your code here.
+
+	return nil
+}
+
+func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) error {
+	// Your code here.
+
+	return nil
+}
+
+func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) error {
+	// Your code here.
+
+	return nil
+}
+
+// please don't change these two functions.
+func (sm *ShardMaster) Kill() {
+	atomic.StoreInt32(&sm.dead, 1)
+	sm.l.Close()
+	sm.px.Kill()
+}
+
+// call this to find out if the server is dead.
+func (sm *ShardMaster) isdead() bool {
+	return atomic.LoadInt32(&sm.dead) != 0
+}
+
+// please do not change these two functions.
+func (sm *ShardMaster) setunreliable(what bool) {
+	if what {
+		atomic.StoreInt32(&sm.unreliable, 1)
+	} else {
+		atomic.StoreInt32(&sm.unreliable, 0)
+	}
+}
+
+func (sm *ShardMaster) isunreliable() bool {
+	return atomic.LoadInt32(&sm.unreliable) != 0
+}
+
+//
+// servers[] contains the ports of the set of
+// servers that will cooperate via Paxos to
+// form the fault-tolerant shardmaster service.
+// me is the index of the current server in servers[].
+//
+func StartServer(servers []string, me int) *ShardMaster {
+	sm := new(ShardMaster)
+	sm.me = me
+
+	sm.configs = make([]Config, 1)
+	sm.configs[0].Groups = map[int64][]string{}
+
+	rpcs := rpc.NewServer()
+
+	gob.Register(Op{})
+	rpcs.Register(sm)
+	sm.px = paxos.Make(servers, me, rpcs)
+
+	os.Remove(servers[me])
+	l, e := net.Listen("unix", servers[me])
+	if e != nil {
+		log.Fatal("listen error: ", e)
+	}
+	sm.l = l
+
+	// please do not change any of the following code,
+	// or do anything to subvert it.
+
+	go func() {
+		for sm.isdead() == false {
+			conn, err := sm.l.Accept()
+			if err == nil && sm.isdead() == false {
+				if sm.isunreliable() && (rand.Int63()%1000) < 100 {
+					// discard the request.
+					conn.Close()
+				} else if sm.isunreliable() && (rand.Int63()%1000) < 200 {
+					// process the request but force discard of reply.
+					c1 := conn.(*net.UnixConn)
+					f, _ := c1.File()
+					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+					if err != nil {
+						fmt.Printf("shutdown: %v\n", err)
+					}
+					go rpcs.ServeConn(conn)
+				} else {
+					go rpcs.ServeConn(conn)
+				}
+			} else if err == nil {
+				conn.Close()
+			}
+			if err != nil && sm.isdead() == false {
+				fmt.Printf("ShardMaster(%v) accept: %v\n", me, err.Error())
+				sm.Kill()
+			}
+		}
+	}()
+
+	return sm
+}
+
+package shardmaster
+
+import "testing"
+import "runtime"
+import "strconv"
+import "os"
+
+// import "time"
+import "fmt"
+import "math/rand"
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "sm-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+func cleanup(sma []*ShardMaster) {
+	for i := 0; i < len(sma); i++ {
+		if sma[i] != nil {
+			sma[i].Kill()
+		}
+	}
+}
+
+//
+// maybe should take a cka[] and find the server with
+// the highest Num.
+//
+func check(t *testing.T, groups []int64, ck *Clerk) {
+	c := ck.Query(-1)
+	if len(c.Groups) != len(groups) {
+		t.Fatalf("wanted %v groups, got %v", len(groups), len(c.Groups))
+	}
+
+	// are the groups as expected?
+	for _, g := range groups {
+		_, ok := c.Groups[g]
+		if ok != true {
+			t.Fatalf("missing group %v", g)
+		}
+	}
+
+	// any un-allocated shards?
+	if len(groups) > 0 {
+		for s, g := range c.Shards {
+			_, ok := c.Groups[g]
+			if ok == false {
+				t.Fatalf("shard %v -> invalid group %v", s, g)
+			}
+		}
+	}
+
+	// more or less balanced sharding?
+	counts := map[int64]int{}
+	for _, g := range c.Shards {
+		counts[g] += 1
+	}
+	min := 257
+	max := 0
+	for g, _ := range c.Groups {
+		if counts[g] > max {
+			max = counts[g]
+		}
+		if counts[g] < min {
+			min = counts[g]
+		}
+	}
+	if max > min+1 {
+		t.Fatalf("max %v too much larger than min %v", max, min)
+	}
+}
+
+func TestBasic(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var sma []*ShardMaster = make([]*ShardMaster, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(sma)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("basic", i)
+	}
+	for i := 0; i < nservers; i++ {
+		sma[i] = StartServer(kvh, i)
+	}
+
+	ck := MakeClerk(kvh)
+	var cka [nservers]*Clerk
+	for i := 0; i < nservers; i++ {
+		cka[i] = MakeClerk([]string{kvh[i]})
+	}
+
+	fmt.Printf("Test: Basic leave/join ...\n")
+
+	cfa := make([]Config, 6)
+	cfa[0] = ck.Query(-1)
+
+	check(t, []int64{}, ck)
+
+	var gid1 int64 = 1
+	ck.Join(gid1, []string{"x", "y", "z"})
+	check(t, []int64{gid1}, ck)
+	cfa[1] = ck.Query(-1)
+
+	var gid2 int64 = 2
+	ck.Join(gid2, []string{"a", "b", "c"})
+	check(t, []int64{gid1, gid2}, ck)
+	cfa[2] = ck.Query(-1)
+
+	ck.Join(gid2, []string{"a", "b", "c"})
+	check(t, []int64{gid1, gid2}, ck)
+	cfa[3] = ck.Query(-1)
+
+	cfx := ck.Query(-1)
+	sa1 := cfx.Groups[gid1]
+	if len(sa1) != 3 || sa1[0] != "x" || sa1[1] != "y" || sa1[2] != "z" {
+		t.Fatalf("wrong servers for gid %v: %v\n", gid1, sa1)
+	}
+	sa2 := cfx.Groups[gid2]
+	if len(sa2) != 3 || sa2[0] != "a" || sa2[1] != "b" || sa2[2] != "c" {
+		t.Fatalf("wrong servers for gid %v: %v\n", gid2, sa2)
+	}
+
+	ck.Leave(gid1)
+	check(t, []int64{gid2}, ck)
+	cfa[4] = ck.Query(-1)
+
+	ck.Leave(gid1)
+	check(t, []int64{gid2}, ck)
+	cfa[5] = ck.Query(-1)
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Historical queries ...\n")
+
+	for i := 0; i < len(cfa); i++ {
+		c := ck.Query(cfa[i].Num)
+		if c.Num != cfa[i].Num {
+			t.Fatalf("historical Num wrong")
+		}
+		if c.Shards != cfa[i].Shards {
+			t.Fatalf("historical Shards wrong")
+		}
+		if len(c.Groups) != len(cfa[i].Groups) {
+			t.Fatalf("number of historical Groups is wrong")
+		}
+		for gid, sa := range c.Groups {
+			sa1, ok := cfa[i].Groups[gid]
+			if ok == false || len(sa1) != len(sa) {
+				t.Fatalf("historical len(Groups) wrong")
+			}
+			if ok && len(sa1) == len(sa) {
+				for j := 0; j < len(sa); j++ {
+					if sa[j] != sa1[j] {
+						t.Fatalf("historical Groups wrong")
+					}
+				}
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Move ...\n")
+	{
+		var gid3 int64 = 503
+		ck.Join(gid3, []string{"3a", "3b", "3c"})
+		var gid4 int64 = 504
+		ck.Join(gid4, []string{"4a", "4b", "4c"})
+		for i := 0; i < NShards; i++ {
+			cf := ck.Query(-1)
+			if i < NShards/2 {
+				ck.Move(i, gid3)
+				if cf.Shards[i] != gid3 {
+					cf1 := ck.Query(-1)
+					if cf1.Num <= cf.Num {
+						t.Fatalf("Move should increase Config.Num")
+					}
+				}
+			} else {
+				ck.Move(i, gid4)
+				if cf.Shards[i] != gid4 {
+					cf1 := ck.Query(-1)
+					if cf1.Num <= cf.Num {
+						t.Fatalf("Move should increase Config.Num")
+					}
+				}
+			}
+		}
+		cf2 := ck.Query(-1)
+		for i := 0; i < NShards; i++ {
+			if i < NShards/2 {
+				if cf2.Shards[i] != gid3 {
+					t.Fatalf("expected shard %v on gid %v actually %v",
+						i, gid3, cf2.Shards[i])
+				}
+			} else {
+				if cf2.Shards[i] != gid4 {
+					t.Fatalf("expected shard %v on gid %v actually %v",
+						i, gid4, cf2.Shards[i])
+				}
+			}
+		}
+		ck.Leave(gid3)
+		ck.Leave(gid4)
+	}
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Concurrent leave/join ...\n")
+
+	const npara = 10
+	gids := make([]int64, npara)
+	var ca [npara]chan bool
+	for xi := 0; xi < npara; xi++ {
+		gids[xi] = int64(xi + 1)
+		ca[xi] = make(chan bool)
+		go func(i int) {
+			defer func() { ca[i] <- true }()
+			var gid int64 = gids[i]
+			cka[(i+0)%nservers].Join(gid+1000, []string{"a", "b", "c"})
+			cka[(i+0)%nservers].Join(gid, []string{"a", "b", "c"})
+			cka[(i+1)%nservers].Leave(gid + 1000)
+		}(xi)
+	}
+	for i := 0; i < npara; i++ {
+		<-ca[i]
+	}
+	check(t, gids, ck)
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Min advances after joins ...\n")
+
+	for i, sm := range sma {
+		if sm.px.Min() <= 0 {
+			t.Fatalf("Min() for %s did not advance", kvh[i])
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Minimal transfers after joins ...\n")
+
+	c1 := ck.Query(-1)
+	for i := 0; i < 5; i++ {
+		ck.Join(int64(npara+1+i), []string{"a", "b", "c"})
+	}
+	c2 := ck.Query(-1)
+	for i := int64(1); i <= npara; i++ {
+		for j := 0; j < len(c1.Shards); j++ {
+			if c2.Shards[j] == i {
+				if c1.Shards[j] != i {
+					t.Fatalf("non-minimal transfer after Join()s")
+				}
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Minimal transfers after leaves ...\n")
+
+	for i := 0; i < 5; i++ {
+		ck.Leave(int64(npara + 1 + i))
+	}
+	c3 := ck.Query(-1)
+	for i := int64(1); i <= npara; i++ {
+		for j := 0; j < len(c1.Shards); j++ {
+			if c2.Shards[j] == i {
+				if c3.Shards[j] != i {
+					t.Fatalf("non-minimal transfer after Leave()s")
+				}
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestUnreliable(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var sma []*ShardMaster = make([]*ShardMaster, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(sma)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("unrel", i)
+	}
+	for i := 0; i < nservers; i++ {
+		sma[i] = StartServer(kvh, i)
+		// don't turn on unreliable because the assignment
+		// doesn't require the shardmaster to detect duplicate
+		// client requests.
+		// sma[i].setunreliable(true)
+	}
+
+	ck := MakeClerk(kvh)
+	var cka [nservers]*Clerk
+	for i := 0; i < nservers; i++ {
+		cka[i] = MakeClerk([]string{kvh[i]})
+	}
+
+	fmt.Printf("Test: Concurrent leave/join, failure ...\n")
+
+	const npara = 20
+	gids := make([]int64, npara)
+	var ca [npara]chan bool
+	for xi := 0; xi < npara; xi++ {
+		gids[xi] = int64(xi + 1)
+		ca[xi] = make(chan bool)
+		go func(i int) {
+			defer func() { ca[i] <- true }()
+			var gid int64 = gids[i]
+			cka[1+(rand.Int()%2)].Join(gid+1000, []string{"a", "b", "c"})
+			cka[1+(rand.Int()%2)].Join(gid, []string{"a", "b", "c"})
+			cka[1+(rand.Int()%2)].Leave(gid + 1000)
+			// server 0 won't be able to hear any RPCs.
+			os.Remove(kvh[0])
+		}(xi)
+	}
+	for i := 0; i < npara; i++ {
+		<-ca[i]
+	}
+	check(t, gids, ck)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestFreshQuery(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var sma []*ShardMaster = make([]*ShardMaster, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(sma)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("fresh", i)
+	}
+	for i := 0; i < nservers; i++ {
+		sma[i] = StartServer(kvh, i)
+	}
+
+	ck1 := MakeClerk([]string{kvh[1]})
+
+	fmt.Printf("Test: Query() returns latest configuration ...\n")
+
+	portx := kvh[0] + strconv.Itoa(rand.Int())
+	if os.Rename(kvh[0], portx) != nil {
+		t.Fatalf("os.Rename() failed")
+	}
+	ck0 := MakeClerk([]string{portx})
+
+	ck1.Join(1001, []string{"a", "b", "c"})
+	c := ck0.Query(-1)
+	_, ok := c.Groups[1001]
+	if ok == false {
+		t.Fatalf("Query(-1) produced a stale configuration")
+	}
+
+	fmt.Printf("  ... Passed\n")
+	os.Remove(portx)
+}
+
+package diskv
+
+import "shardmaster"
+import "net/rpc"
+import "time"
+import "sync"
+import "fmt"
+import "crypto/rand"
+import "math/big"
+
+type Clerk struct {
+	mu     sync.Mutex // one RPC at a time
+	sm     *shardmaster.Clerk
+	config shardmaster.Config
+	// You'll have to modify Clerk.
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
+func MakeClerk(shardmasters []string) *Clerk {
+	ck := new(Clerk)
+	ck.sm = shardmaster.MakeClerk(shardmasters)
+	// You'll have to modify MakeClerk.
+	return ck
+}
+
+//
+// call() sends an RPC to the rpcname handler on server srv
+// with arguments args, waits for the reply, and leaves the
+// reply in reply. the reply argument should be a pointer
+// to a reply structure.
+//
+// the return value is true if the server responded, and false
+// if call() was not able to contact the server. in particular,
+// the reply's contents are only valid if call() returned true.
+//
+// you should assume that call() will return an
+// error after a while if the server is dead.
+// don't provide your own time-out mechanism.
+//
+// please use call() to send all RPCs, in client.go and server.go.
+// please don't change this function.
+//
+func call(srv string, rpcname string,
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
+}
+
+//
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+//
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardmaster.NShards
+	return shard
+}
+
+//
+// fetch the current value for a key.
+// returns "" if the key does not exist.
+// keeps trying forever in the face of all other errors.
+//
+func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	// You'll have to modify Get().
+
+	for {
+		shard := key2shard(key)
+
+		gid := ck.config.Shards[shard]
+
+		servers, ok := ck.config.Groups[gid]
+
+		if ok {
+			// try each server in the shard's replication group.
+			for _, srv := range servers {
+				args := &GetArgs{}
+				args.Key = key
+				var reply GetReply
+				ok := call(srv, "DisKV.Get", args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					return reply.Value
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+}
+
+// send a Put or Append request.
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	// You'll have to modify PutAppend().
+
+	for {
+		shard := key2shard(key)
+
+		gid := ck.config.Shards[shard]
+
+		servers, ok := ck.config.Groups[gid]
+
+		if ok {
+			// try each server in the shard's replication group.
+			for _, srv := range servers {
+				args := &PutAppendArgs{}
+				args.Key = key
+				args.Value = value
+				args.Op = op
+				var reply PutAppendReply
+				ok := call(srv, "DisKV.PutAppend", args, &reply)
+				if ok && reply.Err == OK {
+					return
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+}
+
+func (ck *Clerk) Put(key string, value string) {
+	ck.PutAppend(key, value, "Put")
+}
+func (ck *Clerk) Append(key string, value string) {
+	ck.PutAppend(key, value, "Append")
+}
+
+package diskv
+
+//
+// Sharded key/value server.
+// Lots of replica groups, each running op-at-a-time paxos.
+// Shardmaster decides which group serves each shard.
+// Shardmaster may change shard assignment from time to time.
+//
+// You will have to modify these definitions.
+//
+
+const (
+	OK            = "OK"
+	ErrNoKey      = "ErrNoKey"
+	ErrWrongGroup = "ErrWrongGroup"
+)
+
+type Err string
+
+type PutAppendArgs struct {
+	Key   string
+	Value string
+	Op    string // "Put" or "Append"
+	// You'll have to add definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+
+}
+
+type PutAppendReply struct {
+	Err Err
+}
+
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+}
+
+type GetReply struct {
+	Err   Err
+	Value string
+}
+
+package diskv
+
+import "net"
+import "fmt"
+import "net/rpc"
+import "log"
+import "time"
+import "paxos"
+import "sync"
+import "sync/atomic"
+import "os"
+import "syscall"
+import "encoding/gob"
+import "encoding/base32"
+import "math/rand"
+import "shardmaster"
+import "io/ioutil"
+import "strconv"
+
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+
+type Op struct {
+	// Your definitions here.
+}
+
+
+type DisKV struct {
+	mu         sync.Mutex
+	l          net.Listener
+	me         int
+	dead       int32 // for testing
+	unreliable int32 // for testing
+	sm         *shardmaster.Clerk
+	px         *paxos.Paxos
+	dir        string // each replica has its own data directory
+
+	gid int64 // my replica group ID
+
+	// Your definitions here.
+}
+
+//
+// these are handy functions that might be useful
+// for reading and writing key/value files, and
+// for reading and writing entire shards.
+// puts the key files for each shard in a separate
+// directory.
+//
+
+func (kv *DisKV) shardDir(shard int) string {
+	d := kv.dir + "/shard-" + strconv.Itoa(shard) + "/"
+	// create directory if needed.
+	_, err := os.Stat(d)
+	if err != nil {
+		if err := os.Mkdir(d, 0777); err != nil {
+			log.Fatalf("Mkdir(%v): %v", d, err)
+		}
+	}
+	return d
+}
+
+// cannot use keys in file names directly, since
+// they might contain troublesome characters like /.
+// base32-encode the key to get a file name.
+// base32 rather than base64 b/c Mac has case-insensitive
+// file names.
+func (kv *DisKV) encodeKey(key string) string {
+	return base32.StdEncoding.EncodeToString([]byte(key))
+}
+
+func (kv *DisKV) decodeKey(filename string) (string, error) {
+	key, err := base32.StdEncoding.DecodeString(filename)
+	return string(key), err
+}
+
+// read the content of a key's file.
+func (kv *DisKV) fileGet(shard int, key string) (string, error) {
+	fullname := kv.shardDir(shard) + "/key-" + kv.encodeKey(key)
+	content, err := ioutil.ReadFile(fullname)
+	return string(content), err
+}
+
+// replace the content of a key's file.
+// uses rename() to make the replacement atomic with
+// respect to crashes.
+func (kv *DisKV) filePut(shard int, key string, content string) error {
+	fullname := kv.shardDir(shard) + "/key-" + kv.encodeKey(key)
+	tempname := kv.shardDir(shard) + "/temp-" + kv.encodeKey(key)
+	if err := ioutil.WriteFile(tempname, []byte(content), 0666); err != nil {
+		return err
+	}
+	if err := os.Rename(tempname, fullname); err != nil {
+		return err
+	}
+	return nil
+}
+
+// return content of every key file in a given shard.
+func (kv *DisKV) fileReadShard(shard int) map[string]string {
+	m := map[string]string{}
+	d := kv.shardDir(shard)
+	files, err := ioutil.ReadDir(d)
+	if err != nil {
+		log.Fatalf("fileReadShard could not read %v: %v", d, err)
+	}
+	for _, fi := range files {
+		n1 := fi.Name()
+		if n1[0:4] == "key-" {
+			key, err := kv.decodeKey(n1[4:])
+			if err != nil {
+				log.Fatalf("fileReadShard bad file name %v: %v", n1, err)
+			}
+			content, err := kv.fileGet(shard, key)
+			if err != nil {
+				log.Fatalf("fileReadShard fileGet failed for %v: %v", key, err)
+			}
+			m[key] = content
+		}
+	}
+	return m
+}
+
+// replace an entire shard directory.
+func (kv *DisKV) fileReplaceShard(shard int, m map[string]string) {
+	d := kv.shardDir(shard)
+	os.RemoveAll(d) // remove all existing files from shard.
+	for k, v := range m {
+		kv.filePut(shard, k, v)
+	}
+}
+
+
+func (kv *DisKV) Get(args *GetArgs, reply *GetReply) error {
+	// Your code here.
+	return nil
+}
+
+// RPC handler for client Put and Append requests
+func (kv *DisKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	// Your code here.
+	return nil
+}
+
+//
+// Ask the shardmaster if there's a new configuration;
+// if so, re-configure.
+//
+func (kv *DisKV) tick() {
+	// Your code here.
+}
+
+// tell the server to shut itself down.
+// please don't change these two functions.
+func (kv *DisKV) kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.l.Close()
+	kv.px.Kill()
+}
+
+// call this to find out if the server is dead.
+func (kv *DisKV) isdead() bool {
+	return atomic.LoadInt32(&kv.dead) != 0
+}
+
+// please do not change these two functions.
+func (kv *DisKV) Setunreliable(what bool) {
+	if what {
+		atomic.StoreInt32(&kv.unreliable, 1)
+	} else {
+		atomic.StoreInt32(&kv.unreliable, 0)
+	}
+}
+
+func (kv *DisKV) isunreliable() bool {
+	return atomic.LoadInt32(&kv.unreliable) != 0
+}
+
+//
+// Start a shardkv server.
+// gid is the ID of the server's replica group.
+// shardmasters[] contains the ports of the
+//   servers that implement the shardmaster.
+// servers[] contains the ports of the servers
+//   in this replica group.
+// Me is the index of this server in servers[].
+// dir is the directory name under which this
+//   replica should store all its files.
+//   each replica is passed a different directory.
+// restart is false the very first time this server
+//   is started, and true to indicate a re-start
+//   after a crash or after a crash with disk loss.
+//
+func StartServer(gid int64, shardmasters []string,
+	servers []string, me int, dir string, restart bool) *DisKV {
+
+	kv := new(DisKV)
+	kv.me = me
+	kv.gid = gid
+	kv.sm = shardmaster.MakeClerk(shardmasters)
+	kv.dir = dir
+
+	// Your initialization code here.
+	// Don't call Join().
+
+	// log.SetOutput(ioutil.Discard)
+
+	gob.Register(Op{})
+
+	rpcs := rpc.NewServer()
+	rpcs.Register(kv)
+
+	kv.px = paxos.Make(servers, me, rpcs)
+
+	// log.SetOutput(os.Stdout)
+
+
+
+	os.Remove(servers[me])
+	l, e := net.Listen("unix", servers[me])
+	if e != nil {
+		log.Fatal("listen error: ", e)
+	}
+	kv.l = l
+
+	// please do not change any of the following code,
+	// or do anything to subvert it.
+
+	go func() {
+		for kv.isdead() == false {
+			conn, err := kv.l.Accept()
+			if err == nil && kv.isdead() == false {
+				if kv.isunreliable() && (rand.Int63()%1000) < 100 {
+					// discard the request.
+					conn.Close()
+				} else if kv.isunreliable() && (rand.Int63()%1000) < 200 {
+					// process the request but force discard of reply.
+					c1 := conn.(*net.UnixConn)
+					f, _ := c1.File()
+					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+					if err != nil {
+						fmt.Printf("shutdown: %v\n", err)
+					}
+					go rpcs.ServeConn(conn)
+				} else {
+					go rpcs.ServeConn(conn)
+				}
+			} else if err == nil {
+				conn.Close()
+			}
+			if err != nil && kv.isdead() == false {
+				fmt.Printf("DisKV(%v) accept: %v\n", me, err.Error())
+				kv.kill()
+			}
+		}
+	}()
+
+	go func() {
+		for kv.isdead() == false {
+			kv.tick()
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	return kv
+}
+
+package diskv
+
+import "testing"
+import "shardmaster"
+import "runtime"
+import "strconv"
+import "strings"
+import "os"
+import "os/exec"
+import "time"
+import "fmt"
+import "sync"
+import "io/ioutil"
+import "log"
+import "math/rand"
+import crand "crypto/rand"
+import "encoding/base64"
+import "path/filepath"
+import "sync/atomic"
+
+type tServer struct {
+	p       *os.Process
+	port    string // this replica's port name
+	dir     string // directory for persistent data
+	started bool   // has started at least once already
+}
+
+// information about the servers of one replica group.
+type tGroup struct {
+	gid     int64
+	servers []*tServer
+}
+
+// information about all the servers of a k/v cluster.
+type tCluster struct {
+	t           *testing.T
+	dir         string
+	unreliable  bool
+	masters     []*shardmaster.ShardMaster
+	mck         *shardmaster.Clerk
+	masterports []string
+	groups      []*tGroup
+}
+
+func randstring(n int) string {
+	b := make([]byte, 2*n)
+	crand.Read(b)
+	s := base64.URLEncoding.EncodeToString(b)
+	return s[0:n]
+}
+
+func (tc *tCluster) newport() string {
+	return tc.dir + randstring(12)
+}
+
+//
+// start a k/v replica server process.
+// use separate process, rather than thread, so we
+// can kill a replica unexpectedly.
+// ../main/diskvd
+//
+func (tc *tCluster) start1(gi int, si int) {
+	args := []string{"../main/diskvd"}
+
+	attr := &os.ProcAttr{}
+	in, err := os.Open("/dev/null")
+	attr.Files = make([]*os.File, 3)
+	attr.Files[0] = in
+	attr.Files[1] = os.Stdout
+	attr.Files[2] = os.Stderr
+
+	g := tc.groups[gi]
+	s := g.servers[si]
+
+	args = append(args, "-g")
+	args = append(args, strconv.FormatInt(g.gid, 10))
+	for _, m := range tc.masterports {
+		args = append(args, "-m")
+		args = append(args, m)
+	}
+	for _, sx := range g.servers {
+		args = append(args, "-s")
+		args = append(args, sx.port)
+	}
+	args = append(args, "-i")
+	args = append(args, strconv.Itoa(si))
+	args = append(args, "-u")
+	args = append(args, strconv.FormatBool(tc.unreliable))
+	args = append(args, "-d")
+	args = append(args, s.dir)
+	args = append(args, "-r")
+	args = append(args, strconv.FormatBool(s.started)) // re-start?
+
+	p, err := os.StartProcess(args[0], args, attr)
+	if err != nil {
+		tc.t.Fatalf("StartProcess(%v): %v\n", args[0], err)
+	}
+
+	s.p = p
+	s.started = true
+}
+
+func (tc *tCluster) kill1(gi int, si int, deletefiles bool) {
+	g := tc.groups[gi]
+	s := g.servers[si]
+	if s.p != nil {
+		s.p.Kill()
+		s.p.Wait()
+		s.p = nil
+	}
+	if deletefiles {
+		if err := os.RemoveAll(s.dir); err != nil {
+			tc.t.Fatalf("RemoveAll")
+		}
+		os.Mkdir(s.dir, 0777)
+	}
+}
+
+func (tc *tCluster) cleanup() {
+	for gi := 0; gi < len(tc.groups); gi++ {
+		g := tc.groups[gi]
+		for si := 0; si < len(g.servers); si++ {
+			tc.kill1(gi, si, false)
+		}
+	}
+
+	for i := 0; i < len(tc.masters); i++ {
+		if tc.masters[i] != nil {
+			tc.masters[i].Kill()
+		}
+	}
+
+	// this RemoveAll, along with the directory naming
+	// policy in setup(), means that you can't run
+	// concurrent tests. the reason is to avoid accumulating
+	// lots of stuff in /var/tmp on Athena.
+	os.RemoveAll(tc.dir)
+}
+
+func (tc *tCluster) shardclerk() *shardmaster.Clerk {
+	return shardmaster.MakeClerk(tc.masterports)
+}
+
+func (tc *tCluster) clerk() *Clerk {
+	return MakeClerk(tc.masterports)
+}
+
+func (tc *tCluster) join(gi int) {
+	ports := []string{}
+	for _, s := range tc.groups[gi].servers {
+		ports = append(ports, s.port)
+	}
+	tc.mck.Join(tc.groups[gi].gid, ports)
+}
+
+func (tc *tCluster) leave(gi int) {
+	tc.mck.Leave(tc.groups[gi].gid)
+}
+
+// how many total bytes of file space in use?
+func (tc *tCluster) space() int64 {
+	var bytes int64 = 0
+	ff := func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsDir() == false {
+			bytes += info.Size()
+		}
+		return nil
+	}
+	filepath.Walk(tc.dir, ff)
+	return bytes
+}
+
+func setup(t *testing.T, tag string, ngroups int, nreplicas int, unreliable bool) *tCluster {
+	runtime.GOMAXPROCS(4)
+
+	// compile ../main/diskvd.go
+	// cmd := exec.Command("go", "build", "-race", "diskvd.go")
+	cmd := exec.Command("go", "build", "diskvd.go")
+	cmd.Dir = "../main"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("could not compile ../main/diskvd.go: %v", err)
+	}
+
+	const nmasters = 3
+
+	tc := &tCluster{}
+	tc.t = t
+	tc.unreliable = unreliable
+
+	tc.dir = "/var/tmp/824-"
+	tc.dir += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(tc.dir, 0777)
+	tc.dir += "lab5-" + tag + "/"
+	os.RemoveAll(tc.dir)
+	os.Mkdir(tc.dir, 0777)
+
+	tc.masters = make([]*shardmaster.ShardMaster, nmasters)
+	tc.masterports = make([]string, nmasters)
+	for i := 0; i < nmasters; i++ {
+		tc.masterports[i] = tc.newport()
+	}
+	log.SetOutput(ioutil.Discard) // suppress method errors &c
+	for i := 0; i < nmasters; i++ {
+		tc.masters[i] = shardmaster.StartServer(tc.masterports, i)
+	}
+	log.SetOutput(os.Stdout) // re-enable error output.
+	tc.mck = tc.shardclerk()
+
+	tc.groups = make([]*tGroup, ngroups)
+
+	for i := 0; i < ngroups; i++ {
+		g := &tGroup{}
+		tc.groups[i] = g
+		g.gid = int64(i + 100)
+		g.servers = make([]*tServer, nreplicas)
+		for j := 0; j < nreplicas; j++ {
+			g.servers[j] = &tServer{}
+			g.servers[j].port = tc.newport()
+			g.servers[j].dir = tc.dir + randstring(12)
+			if err := os.Mkdir(g.servers[j].dir, 0777); err != nil {
+				t.Fatalf("Mkdir(%v): %v", g.servers[j].dir, err)
+			}
+		}
+		for j := 0; j < nreplicas; j++ {
+			tc.start1(i, j)
+		}
+	}
+
+	// return smh, gids, ha, sa, clean
+	return tc
+}
+
+//
+// these tests are the same as in Lab 4.
+//
+
+func Test4Basic(t *testing.T) {
+	tc := setup(t, "basic", 3, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Basic Join/Leave (lab4) ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	ck.Put("a", "x")
+	ck.Append("a", "b")
+	if ck.Get("a") != "xb" {
+		t.Fatalf("wrong value")
+	}
+
+	keys := make([]string, 10)
+	vals := make([]string, len(keys))
+	for i := 0; i < len(keys); i++ {
+		keys[i] = strconv.Itoa(rand.Int())
+		vals[i] = strconv.Itoa(rand.Int())
+		ck.Put(keys[i], vals[i])
+	}
+
+	// are keys still there after joins?
+	for gi := 1; gi < len(tc.groups); gi++ {
+		tc.join(gi)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("joining; wrong value; g=%v k=%v wanted=%v got=%v",
+					gi, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	// are keys still there after leaves?
+	for gi := 0; gi < len(tc.groups)-1; gi++ {
+		tc.leave(gi)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("leaving; wrong value; g=%v k=%v wanted=%v got=%v",
+					gi, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func Test4Move(t *testing.T) {
+	tc := setup(t, "move", 3, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Shards really move (lab4) ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	// insert one key per shard
+	for i := 0; i < shardmaster.NShards; i++ {
+		ck.Put(string('0'+i), string('0'+i))
+	}
+
+	// add group 1.
+	tc.join(1)
+	time.Sleep(5 * time.Second)
+
+	// check that keys are still there.
+	for i := 0; i < shardmaster.NShards; i++ {
+		if ck.Get(string('0'+i)) != string('0'+i) {
+			t.Fatalf("missing key/value")
+		}
+	}
+
+	// remove sockets from group 0.
+	for _, s := range tc.groups[0].servers {
+		os.Remove(s.port)
+	}
+
+	count := int32(0)
+	var mu sync.Mutex
+	for i := 0; i < shardmaster.NShards; i++ {
+		go func(me int) {
+			myck := tc.clerk()
+			v := myck.Get(string('0' + me))
+			if v == string('0'+me) {
+				mu.Lock()
+				atomic.AddInt32(&count, 1)
+				mu.Unlock()
+			} else {
+				t.Fatalf("Get(%v) yielded %v\n", me, v)
+			}
+		}(i)
+	}
+
+	time.Sleep(10 * time.Second)
+
+	ccc := atomic.LoadInt32(&count)
+	if ccc > shardmaster.NShards/3 && ccc < 2*(shardmaster.NShards/3) {
+		fmt.Printf("  ... Passed\n")
+	} else {
+		t.Fatalf("%v keys worked after killing 1/2 of groups; wanted %v",
+			ccc, shardmaster.NShards/2)
+	}
+}
+
+func Test4Limp(t *testing.T) {
+	tc := setup(t, "limp", 3, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Reconfiguration with some dead replicas (lab4) ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	ck.Put("a", "b")
+	if ck.Get("a") != "b" {
+		t.Fatalf("got wrong value")
+	}
+
+	// kill one server from each replica group.
+	for gi := 0; gi < len(tc.groups); gi++ {
+		sa := tc.groups[gi].servers
+		tc.kill1(gi, rand.Int()%len(sa), false)
+	}
+
+	keys := make([]string, 10)
+	vals := make([]string, len(keys))
+	for i := 0; i < len(keys); i++ {
+		keys[i] = strconv.Itoa(rand.Int())
+		vals[i] = strconv.Itoa(rand.Int())
+		ck.Put(keys[i], vals[i])
+	}
+
+	// are keys still there after joins?
+	for gi := 1; gi < len(tc.groups); gi++ {
+		tc.join(gi)
+		time.Sleep(1 * time.Second)
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("joining; wrong value; g=%v k=%v wanted=%v got=%v",
+					gi, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	// are keys still there after leaves?
+	for gi := 0; gi < len(tc.groups)-1; gi++ {
+		tc.leave(gi)
+		time.Sleep(2 * time.Second)
+		g := tc.groups[gi]
+		for i := 0; i < len(g.servers); i++ {
+			tc.kill1(gi, i, false)
+		}
+		for i := 0; i < len(keys); i++ {
+			v := ck.Get(keys[i])
+			if v != vals[i] {
+				t.Fatalf("leaving; wrong value; g=%v k=%v wanted=%v got=%v",
+					g, keys[i], vals[i], v)
+			}
+			vals[i] = strconv.Itoa(rand.Int())
+			ck.Put(keys[i], vals[i])
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func doConcurrent(t *testing.T, unreliable bool) {
+	tc := setup(t, "concurrent-"+strconv.FormatBool(unreliable), 3, 3, unreliable)
+	defer tc.cleanup()
+
+	for i := 0; i < len(tc.groups); i++ {
+		tc.join(i)
+	}
+
+	const npara = 11
+	var ca [npara]chan bool
+	for i := 0; i < npara; i++ {
+		ca[i] = make(chan bool)
+		go func(me int) {
+			ok := true
+			defer func() { ca[me] <- ok }()
+			ck := tc.clerk()
+			mymck := tc.shardclerk()
+			key := strconv.Itoa(me)
+			last := ""
+			for iters := 0; iters < 3; iters++ {
+				nv := strconv.Itoa(rand.Int())
+				ck.Append(key, nv)
+				last = last + nv
+				v := ck.Get(key)
+				if v != last {
+					ok = false
+					t.Fatalf("Get(%v) expected %v got %v\n", key, last, v)
+				}
+
+				gi := rand.Int() % len(tc.groups)
+				gid := tc.groups[gi].gid
+				mymck.Move(rand.Int()%shardmaster.NShards, gid)
+
+				time.Sleep(time.Duration(rand.Int()%30) * time.Millisecond)
+			}
+		}(i)
+	}
+
+	for i := 0; i < npara; i++ {
+		x := <-ca[i]
+		if x == false {
+			t.Fatalf("something is wrong")
+		}
+	}
+}
+
+func Test4Concurrent(t *testing.T) {
+	fmt.Printf("Test: Concurrent Put/Get/Move (lab4) ...\n")
+	doConcurrent(t, false)
+	fmt.Printf("  ... Passed\n")
+}
+
+func Test4ConcurrentUnreliable(t *testing.T) {
+	fmt.Printf("Test: Concurrent Put/Get/Move (unreliable) (lab4) ...\n")
+	doConcurrent(t, true)
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// the rest of the tests are lab5-specific.
+//
+
+//
+// do the servers write k/v pairs to disk, so that they
+// are still available after kill+restart?
+//
+func Test5BasicPersistence(t *testing.T) {
+	tc := setup(t, "basicpersistence", 1, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Basic Persistence ...\n")
+
+	tc.join(0)
+
+	ck := tc.clerk()
+
+	ck.Append("a", "x")
+	ck.Append("a", "y")
+	if ck.Get("a") != "xy" {
+		t.Fatalf("wrong value")
+	}
+
+	// kill all servers in all groups.
+	for gi, g := range tc.groups {
+		for si, _ := range g.servers {
+			tc.kill1(gi, si, false)
+		}
+	}
+
+	// check that requests are not executed.
+	ch := make(chan string)
+	go func() {
+		ck1 := tc.clerk()
+		v := ck1.Get("a")
+		ch <- v
+	}()
+
+	select {
+	case <-ch:
+		t.Fatalf("Get should not have succeeded after killing all servers.")
+	case <-time.After(3 * time.Second):
+		// this is what we hope for.
+	}
+
+	// restart all servers, check that they recover the data.
+	for gi, g := range tc.groups {
+		for si, _ := range g.servers {
+			tc.start1(gi, si)
+		}
+	}
+	time.Sleep(2 * time.Second)
+	ck.Append("a", "z")
+	v := ck.Get("a")
+	if v != "xyz" {
+		t.Fatalf("wrong value %v after restart", v)
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// if server S1 is dead for a bit, and others accept operations,
+// do they bring S1 up to date correctly after it restarts?
+//
+func Test5OneRestart(t *testing.T) {
+	tc := setup(t, "onerestart", 1, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: One server restarts ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+	g0 := tc.groups[0]
+
+	k1 := randstring(10)
+	k1v := randstring(10)
+	ck.Append(k1, k1v)
+
+	k2 := randstring(10)
+	k2v := randstring(10)
+	ck.Put(k2, k2v)
+
+	for i := 0; i < len(g0.servers); i++ {
+		k1x := ck.Get(k1)
+		if k1x != k1v {
+			t.Fatalf("wrong value for k1, i=%v, wanted=%v, got=%v", i, k1v, k1x)
+		}
+		k2x := ck.Get(k2)
+		if k2x != k2v {
+			t.Fatalf("wrong value for k2")
+		}
+
+		tc.kill1(0, i, false)
+		time.Sleep(1 * time.Second)
+
+		z := randstring(10)
+		k1v += z
+		ck.Append(k1, z)
+
+		k2v = randstring(10)
+		ck.Put(k2, k2v)
+
+		tc.start1(0, i)
+		time.Sleep(2 * time.Second)
+	}
+
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// check that the persistent state isn't too big.
+//
+func Test5DiskUse(t *testing.T) {
+	tc := setup(t, "diskuse", 1, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Servers don't use too much disk space ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+	g0 := tc.groups[0]
+
+	k1 := randstring(10)
+	k1v := randstring(10)
+	ck.Append(k1, k1v)
+
+	k2 := randstring(10)
+	k2v := randstring(10)
+	ck.Put(k2, k2v)
+
+	k3 := randstring(10)
+	k3v := randstring(10)
+	ck.Put(k3, k3v)
+
+	k4 := randstring(10)
+	k4v := randstring(10)
+	ck.Append(k4, k4v)
+
+	n := 100 + (rand.Int() % 20)
+	for i := 0; i < n; i++ {
+		k2v = randstring(1000)
+		ck.Put(k2, k2v)
+		x := randstring(1)
+		ck.Append(k3, x)
+		k3v += x
+		ck.Get(k4)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	k2v = randstring(1000)
+	ck.Put(k2, k2v)
+	time.Sleep(100 * time.Millisecond)
+	x := randstring(1)
+	ck.Append(k3, x)
+	k3v += x
+	time.Sleep(100 * time.Millisecond)
+	ck.Get(k4)
+
+	// let all the replicas tick().
+	time.Sleep(2100 * time.Millisecond)
+
+	max := int64(20 * 1000)
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v)", nb)
+		}
+	}
+
+	for i := 0; i < len(g0.servers); i++ {
+		tc.kill1(0, i, false)
+	}
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		}
+	}
+
+	for i := 0; i < len(g0.servers); i++ {
+		tc.start1(0, i)
+	}
+	time.Sleep(time.Second)
+
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+	if ck.Get(k3) != k3v {
+		t.Fatalf("wrong value for k3")
+	}
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// check that the persistent state isn't too big for Appends.
+//
+func Test5AppendUse(t *testing.T) {
+	tc := setup(t, "appenduse", 1, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Servers don't use too much disk space for Appends ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+	g0 := tc.groups[0]
+
+	k1 := randstring(10)
+	k1v := randstring(10)
+	ck.Append(k1, k1v)
+
+	k2 := randstring(10)
+	k2v := randstring(10)
+	ck.Put(k2, k2v)
+
+	k3 := randstring(10)
+	k3v := randstring(10)
+	ck.Put(k3, k3v)
+
+	k4 := randstring(10)
+	k4v := randstring(10)
+	ck.Append(k4, k4v)
+
+	n := 100 + (rand.Int() % 20)
+	for i := 0; i < n; i++ {
+		k2v = randstring(1000)
+		ck.Put(k2, k2v)
+		x := randstring(1000)
+		ck.Append(k3, x)
+		k3v += x
+		ck.Get(k4)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	k2v = randstring(1000)
+	ck.Put(k2, k2v)
+	time.Sleep(100 * time.Millisecond)
+	x := randstring(1)
+	ck.Append(k3, x)
+	k3v += x
+	time.Sleep(100 * time.Millisecond)
+	ck.Get(k4)
+
+	// let all the replicas tick().
+	time.Sleep(2100 * time.Millisecond)
+
+	max := int64(3*n*1000) + 20000
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		}
+	}
+
+	for i := 0; i < len(g0.servers); i++ {
+		tc.kill1(0, i, false)
+	}
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		}
+	}
+
+	for i := 0; i < len(g0.servers); i++ {
+		tc.start1(0, i)
+	}
+	time.Sleep(time.Second)
+
+	if ck.Get(k3) != k3v {
+		t.Fatalf("wrong value for k3")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+
+	{
+		nb := tc.space()
+		if nb > max {
+			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// recovery if a single replica loses disk content.
+//
+func Test5OneLostDisk(t *testing.T) {
+	tc := setup(t, "onelostdisk", 1, 3, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: One server loses disk and restarts ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+	g0 := tc.groups[0]
+
+	k1 := randstring(10)
+	k1v := ""
+	k2 := randstring(10)
+	k2v := ""
+
+	for i := 0; i < 7+(rand.Int()%7); i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+		k2v = randstring(10)
+		ck.Put(k2, k2v)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k1)
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k2)
+
+	for i := 0; i < len(g0.servers); i++ {
+		k1x := ck.Get(k1)
+		if k1x != k1v {
+			t.Fatalf("wrong value for k1, i=%v, wanted=%v, got=%v", i, k1v, k1x)
+		}
+		k2x := ck.Get(k2)
+		if k2x != k2v {
+			t.Fatalf("wrong value for k2")
+		}
+
+		tc.kill1(0, i, true)
+		time.Sleep(1 * time.Second)
+
+		{
+			z := randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+
+			k2v = randstring(10)
+			ck.Put(k2, k2v)
+		}
+
+		tc.start1(0, i)
+
+		{
+			z := randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+
+			time.Sleep(10 * time.Millisecond)
+			z = randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// one disk lost while another replica is merely down.
+//
+func Test5OneLostOneDown(t *testing.T) {
+	tc := setup(t, "onelostonedown", 1, 5, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: One server down, another loses disk ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+	g0 := tc.groups[0]
+
+	k1 := randstring(10)
+	k1v := ""
+	k2 := randstring(10)
+	k2v := ""
+
+	for i := 0; i < 7+(rand.Int()%7); i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+		k2v = randstring(10)
+		ck.Put(k2, k2v)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k1)
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k2)
+
+	tc.kill1(0, 0, false)
+
+	for i := 1; i < len(g0.servers); i++ {
+		k1x := ck.Get(k1)
+		if k1x != k1v {
+			t.Fatalf("wrong value for k1, i=%v, wanted=%v, got=%v", i, k1v, k1x)
+		}
+		k2x := ck.Get(k2)
+		if k2x != k2v {
+			t.Fatalf("wrong value for k2")
+		}
+
+		tc.kill1(0, i, true)
+		time.Sleep(1 * time.Second)
+
+		{
+			z := randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+
+			k2v = randstring(10)
+			ck.Put(k2, k2v)
+		}
+
+		tc.start1(0, i)
+
+		{
+			z := randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+
+			time.Sleep(10 * time.Millisecond)
+			z = randstring(10)
+			k1v += z
+			ck.Append(k1, z)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+
+	tc.start1(0, 0)
+	ck.Put("a", "b")
+	time.Sleep(1 * time.Second)
+	ck.Put("a", "c")
+	if ck.Get(k1) != k1v {
+		t.Fatalf("wrong value for k1")
+	}
+	if ck.Get(k2) != k2v {
+		t.Fatalf("wrong value for k2")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+// check that all known appends are present in a value,
+// and are in order for each concurrent client.
+func checkAppends(t *testing.T, v string, counts []int) {
+	nclients := len(counts)
+	for i := 0; i < nclients; i++ {
+		lastoff := -1
+		for j := 0; j < counts[i]; j++ {
+			wanted := "x " + strconv.Itoa(i) + " " + strconv.Itoa(j) + " y"
+			off := strings.Index(v, wanted)
+			if off < 0 {
+				t.Fatalf("missing element %v %v in Append result", i, j)
+			}
+			off1 := strings.LastIndex(v, wanted)
+			if off1 != off {
+				t.Fatalf("duplicate element %v %v in Append result", i, j)
+			}
+			if off <= lastoff {
+				t.Fatalf("wrong order for element in Append result")
+			}
+			lastoff = off
+		}
+	}
+}
+
+func doConcurrentCrash(t *testing.T, unreliable bool) {
+	tc := setup(t, "concurrentcrash", 1, 3, unreliable)
+	defer tc.cleanup()
+
+	tc.join(0)
+	ck := tc.clerk()
+
+	k1 := randstring(10)
+	ck.Put(k1, "")
+
+	stop := int32(0)
+
+	ff := func(me int, ch chan int) {
+		ret := -1
+		defer func() { ch <- ret }()
+		myck := tc.clerk()
+		n := 0
+		for atomic.LoadInt32(&stop) == 0 || n < 5 {
+			myck.Append(k1, "x "+strconv.Itoa(me)+" "+strconv.Itoa(n)+" y")
+			n++
+			time.Sleep(200 * time.Millisecond)
+		}
+		ret = n
+	}
+
+	ncli := 5
+	cha := []chan int{}
+	for i := 0; i < ncli; i++ {
+		cha = append(cha, make(chan int))
+		go ff(i, cha[i])
+	}
+
+	for i := 0; i < 3; i++ {
+		tc.kill1(0, i%3, false)
+		time.Sleep(1000 * time.Millisecond)
+		ck.Get(k1)
+		tc.start1(0, i%3)
+		time.Sleep(3000 * time.Millisecond)
+		if unreliable {
+			time.Sleep(5000 * time.Millisecond)
+		}
+		ck.Get(k1)
+	}
+
+	for i := 0; i < 3; i++ {
+		tc.kill1(0, i%3, true)
+		time.Sleep(1000 * time.Millisecond)
+		ck.Get(k1)
+		tc.start1(0, i%3)
+		time.Sleep(3000 * time.Millisecond)
+		if unreliable {
+			time.Sleep(5000 * time.Millisecond)
+		}
+		ck.Get(k1)
+	}
+
+	time.Sleep(2 * time.Second)
+	atomic.StoreInt32(&stop, 1)
+
+	counts := []int{}
+	for i := 0; i < ncli; i++ {
+		n := <-cha[i]
+		if n < 0 {
+			t.Fatal("client failed")
+		}
+		counts = append(counts, n)
+	}
+
+	vx := ck.Get(k1)
+	checkAppends(t, vx, counts)
+
+	for i := 0; i < 3; i++ {
+		tc.kill1(0, i, false)
+		if ck.Get(k1) != vx {
+			t.Fatalf("mismatch")
+		}
+		tc.start1(0, i)
+		if ck.Get(k1) != vx {
+			t.Fatalf("mismatch")
+		}
+		time.Sleep(3000 * time.Millisecond)
+		if unreliable {
+			time.Sleep(5000 * time.Millisecond)
+		}
+		if ck.Get(k1) != vx {
+			t.Fatalf("mismatch")
+		}
+	}
+}
+
+func Test5ConcurrentCrashReliable(t *testing.T) {
+	fmt.Printf("Test: Concurrent Append and Crash ...\n")
+	doConcurrentCrash(t, false)
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// Append() at same time as crash.
+//
+func Test5Simultaneous(t *testing.T) {
+	tc := setup(t, "simultaneous", 1, 3, true)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: Simultaneous Append and Crash ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+
+	k1 := randstring(10)
+	ck.Put(k1, "")
+
+	ch := make(chan int)
+
+	ff := func(x int) {
+		ret := -1
+		defer func() { ch <- ret }()
+		myck := tc.clerk()
+		myck.Append(k1, "x "+strconv.Itoa(0)+" "+strconv.Itoa(x)+" y")
+		ret = 1
+	}
+
+	counts := []int{0}
+
+	for i := 0; i < 50; i++ {
+		go ff(i)
+
+		time.Sleep(time.Duration(rand.Int()%200) * time.Millisecond)
+		if (rand.Int() % 1000) < 500 {
+			tc.kill1(0, i%3, false)
+		} else {
+			tc.kill1(0, i%3, true)
+		}
+		time.Sleep(1000 * time.Millisecond)
+		vx := ck.Get(k1)
+		checkAppends(t, vx, counts)
+		tc.start1(0, i%3)
+		time.Sleep(2200 * time.Millisecond)
+
+		z := <-ch
+		if z != 1 {
+			t.Fatalf("Append thread failed")
+		}
+		counts[0] += z
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// recovery with mixture of lost disks and simple reboot.
+// does a replica that loses its disk wait for majority?
+//
+func Test5RejoinMix1(t *testing.T) {
+	tc := setup(t, "rejoinmix1", 1, 5, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: replica waits correctly after disk loss ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+
+	k1 := randstring(10)
+	k1v := ""
+
+	for i := 0; i < 7+(rand.Int()%7); i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k1)
+
+	tc.kill1(0, 0, false)
+
+	for i := 0; i < 2; i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k1)
+	time.Sleep(300 * time.Millisecond)
+
+	tc.kill1(0, 1, true)
+	tc.kill1(0, 2, true)
+
+	tc.kill1(0, 3, false)
+	tc.kill1(0, 4, false)
+
+	tc.start1(0, 0)
+	tc.start1(0, 1)
+	tc.start1(0, 2)
+	time.Sleep(300 * time.Millisecond)
+
+	// check that requests are not executed.
+	ch := make(chan string)
+	go func() {
+		ck1 := tc.clerk()
+		v := ck1.Get(k1)
+		ch <- v
+	}()
+
+	select {
+	case <-ch:
+		t.Fatalf("Get should not have succeeded.")
+	case <-time.After(3 * time.Second):
+		// this is what we hope for.
+	}
+
+	tc.start1(0, 3)
+	tc.start1(0, 4)
+
+	{
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+	}
+
+	v := ck.Get(k1)
+	if v != k1v {
+		t.Fatalf("Get returned wrong value")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+//
+// does a replica that loses its state avoid
+// changing its mind about Paxos agreements?
+//
+func Test5RejoinMix3(t *testing.T) {
+	tc := setup(t, "rejoinmix3", 1, 5, false)
+	defer tc.cleanup()
+
+	fmt.Printf("Test: replica Paxos resumes correctly after disk loss ...\n")
+
+	tc.join(0)
+	ck := tc.clerk()
+
+	k1 := randstring(10)
+	k1v := ""
+
+	for i := 0; i < 7+(rand.Int()%7); i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	ck.Get(k1)
+
+	// kill R1, R2.
+	tc.kill1(0, 1, false)
+	tc.kill1(0, 2, false)
+
+	// R0, R3, and R4 are up.
+	for i := 0; i < 100+(rand.Int()%7); i++ {
+		x := randstring(10)
+		ck.Append(k1, x)
+		k1v += x
+	}
+
+	// kill R0, lose disk.
+	tc.kill1(0, 0, true)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// restart R1, R2, R0.
+	tc.start1(0, 1)
+	tc.start1(0, 2)
+	time.Sleep(1 * time.Millisecond)
+	tc.start1(0, 0)
+
+	chx := make(chan bool)
+	x1 := randstring(10)
+	x2 := randstring(10)
+	go func() { ck.Append(k1, x1); chx <- true }()
+	time.Sleep(10 * time.Millisecond)
+	go func() { ck.Append(k1, x2); chx <- true }()
+
+	<-chx
+	<-chx
+
+	xv := ck.Get(k1)
+	if xv == k1v+x1+x2 || xv == k1v+x2+x1 {
+		// ok
+	} else {
+		t.Fatalf("wrong value")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+package labrpc
+
+//
+// channel-based RPC, for 824 labs.
+// allows tests to disconnect RPC connections.
+//
+// we will use the original labrpc.go to test your code for grading.
+// so, while you can modify this code to help you debug, please
+// test against the original before submitting.
+//
+// adapted from Go net/rpc/server.go.
+//
+// sends gob-encoded values to ensure that RPCs
+// don't include references to program objects.
+//
+// net := MakeNetwork() -- holds network, clients, servers.
+// end := net.MakeEnd(endname) -- create a client end-point, to talk to one server.
+// net.AddServer(servername, server) -- adds a named server to network.
+// net.DeleteServer(servername) -- eliminate the named server.
+// net.Connect(endname, servername) -- connect a client to a server.
+// net.Enable(endname, enabled) -- enable/disable a client.
+// net.Reliable(bool) -- false means drop/delay messages
+//
+// end.Call("Raft.AppendEntries", args, &reply) -- send an RPC, wait for reply.
+// the "Raft" is the name of the server struct to be called.
+// the "AppendEntries" is the name of the method to be called.
+// Call() returns true to indicate that the server executed the request
+// and the reply is valid.
+// Call() returns false if the network lost the request or reply
+// or the server is down.
+// It is OK to have multiple Call()s in progress at the same time on the
+// same ClientEnd.
+// Concurrent calls to Call() may be delivered to the server out of order,
+// since the network may re-order messages.
+// Call() is guaranteed to return (perhaps after a delay) *except* if the
+// handler function on the server side does not return. That is, there
+// is no need to implement your own timeouts around Call().
+//
+// srv := MakeServer()
+// srv.AddService(svc) -- a server can have multiple services, e.g. Raft and k/v
+//   pass srv to net.AddServer()
+//
+// svc := MakeService(receiverObject) -- obj's methods will handle RPCs
+//   much like Go's rpcs.Register()
+//   pass svc to srv.AddService()
+//
+
+import "encoding/gob"
+import "bytes"
+import "reflect"
+import "sync"
+import "log"
+import "strings"
+import "math/rand"
+import "time"
+
+type reqMsg struct {
+	endname  interface{} // name of sending ClientEnd
+	svcMeth  string      // e.g. "Raft.AppendEntries"
+	argsType reflect.Type
+	args     []byte
+	replyCh  chan replyMsg
+}
+
+type replyMsg struct {
+	ok    bool
+	reply []byte
+}
+
+type ClientEnd struct {
+	endname interface{} // this end-point's name
+	ch      chan reqMsg // copy of Network.endCh
+}
+
+// send an RPC, wait for the reply.
+// the return value indicates success; false means the
+// server couldn't be contacted.
+func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
+	req := reqMsg{}
+	req.endname = e.endname
+	req.svcMeth = svcMeth
+	req.argsType = reflect.TypeOf(args)
+	req.replyCh = make(chan replyMsg)
+
+	qb := new(bytes.Buffer)
+	qe := gob.NewEncoder(qb)
+	qe.Encode(args)
+	req.args = qb.Bytes()
+
+	e.ch <- req
+
+	rep := <-req.replyCh
+	if rep.ok {
+		rb := bytes.NewBuffer(rep.reply)
+		rd := gob.NewDecoder(rb)
+		if err := rd.Decode(reply); err != nil {
+			log.Fatalf("ClientEnd.Call(): decode reply: %v\n", err)
+		}
+		return true
+	} else {
+		return false
+	}
+}
+
+type Network struct {
+	mu             sync.Mutex
+	reliable       bool
+	longDelays     bool                        // pause a long time on send on disabled connection
+	longReordering bool                        // sometimes delay replies a long time
+	ends           map[interface{}]*ClientEnd  // ends, by name
+	enabled        map[interface{}]bool        // by end name
+	servers        map[interface{}]*Server     // servers, by name
+	connections    map[interface{}]interface{} // endname -> servername
+	endCh          chan reqMsg
+}
+
+func MakeNetwork() *Network {
+	rn := &Network{}
+	rn.reliable = true
+	rn.ends = map[interface{}]*ClientEnd{}
+	rn.enabled = map[interface{}]bool{}
+	rn.servers = map[interface{}]*Server{}
+	rn.connections = map[interface{}](interface{}){}
+	rn.endCh = make(chan reqMsg)
+
+	// single goroutine to handle all ClientEnd.Call()s
+	go func() {
+		for xreq := range rn.endCh {
+			go rn.ProcessReq(xreq)
+		}
+	}()
+
+	return rn
+}
+
+func (rn *Network) Reliable(yes bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.reliable = yes
+}
+
+func (rn *Network) LongReordering(yes bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.longReordering = yes
+}
+
+func (rn *Network) LongDelays(yes bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.longDelays = yes
+}
+
+func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
+	servername interface{}, server *Server, reliable bool, longreordering bool,
+) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	enabled = rn.enabled[endname]
+	servername = rn.connections[endname]
+	if servername != nil {
+		server = rn.servers[servername]
+	}
+	reliable = rn.reliable
+	longreordering = rn.longReordering
+	return
+}
+
+func (rn *Network) IsServerDead(endname interface{}, servername interface{}, server *Server) bool {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.enabled[endname] == false || rn.servers[servername] != server {
+		return true
+	}
+	return false
+}
+
+func (rn *Network) ProcessReq(req reqMsg) {
+	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
+
+	if enabled && servername != nil && server != nil {
+		if reliable == false {
+			// short delay
+			ms := (rand.Int() % 27)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+
+		if reliable == false && (rand.Int()%1000) < 100 {
+			// drop the request, return as if timeout
+			req.replyCh <- replyMsg{false, nil}
+			return
+		}
+
+		// execute the request (call the RPC handler).
+		// in a separate thread so that we can periodically check
+		// if the server has been killed and the RPC should get a
+		// failure reply.
+		ech := make(chan replyMsg)
+		go func() {
+			r := server.dispatch(req)
+			ech <- r
+		}()
+
+		// wait for handler to return,
+		// but stop waiting if DeleteServer() has been called,
+		// and return an error.
+		var reply replyMsg
+		replyOK := false
+		serverDead := false
+		for replyOK == false && serverDead == false {
+			select {
+			case reply = <-ech:
+				replyOK = true
+			case <-time.After(100 * time.Millisecond):
+				serverDead = rn.IsServerDead(req.endname, servername, server)
+			}
+		}
+
+		// do not reply if DeleteServer() has been called, i.e.
+		// the server has been killed. this is needed to avoid
+		// situation in which a client gets a positive reply
+		// to an Append, but the server persisted the update
+		// into the old Persister. config.go is careful to call
+		// DeleteServer() before superseding the Persister.
+		serverDead = rn.IsServerDead(req.endname, servername, server)
+
+		if replyOK == false || serverDead == true {
+			// server was killed while we were waiting; return error.
+			req.replyCh <- replyMsg{false, nil}
+		} else if reliable == false && (rand.Int()%1000) < 100 {
+			// drop the reply, return as if timeout
+			req.replyCh <- replyMsg{false, nil}
+		} else if longreordering == true && rand.Intn(900) < 600 {
+			// delay the response for a while
+			ms := 200 + rand.Intn(1+rand.Intn(2000))
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			req.replyCh <- reply
+		} else {
+			req.replyCh <- reply
+		}
+	} else {
+		// simulate no reply and eventual timeout.
+		ms := 0
+		if rn.longDelays {
+			// let Raft tests check that leader doesn't send
+			// RPCs synchronously.
+			ms = (rand.Int() % 7000)
+		} else {
+			// many kv tests require the client to try each
+			// server in fairly rapid succession.
+			ms = (rand.Int() % 100)
+		}
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		req.replyCh <- replyMsg{false, nil}
+	}
+
+}
+
+// create a client end-point.
+// start the thread that listens and delivers.
+func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if _, ok := rn.ends[endname]; ok {
+		log.Fatalf("MakeEnd: %v already exists\n", endname)
+	}
+
+	e := &ClientEnd{}
+	e.endname = endname
+	e.ch = rn.endCh
+	rn.ends[endname] = e
+	rn.enabled[endname] = false
+	rn.connections[endname] = nil
+
+	return e
+}
+
+func (rn *Network) AddServer(servername interface{}, rs *Server) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.servers[servername] = rs
+}
+
+func (rn *Network) DeleteServer(servername interface{}) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.servers[servername] = nil
+}
+
+// connect a ClientEnd to a server.
+// a ClientEnd can only be connected once in its lifetime.
+func (rn *Network) Connect(endname interface{}, servername interface{}) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.connections[endname] = servername
+}
+
+// enable/disable a ClientEnd.
+func (rn *Network) Enable(endname interface{}, enabled bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.enabled[endname] = enabled
+}
+
+// get a server's count of incoming RPCs.
+func (rn *Network) GetCount(servername interface{}) int {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	svr := rn.servers[servername]
+	return svr.GetCount()
+}
+
+//
+// a server is a collection of services, all sharing
+// the same rpc dispatcher. so that e.g. both a Raft
+// and a k/v server can listen to the same rpc endpoint.
+//
+type Server struct {
+	mu       sync.Mutex
+	services map[string]*Service
+	count    int // incoming RPCs
+}
+
+func MakeServer() *Server {
+	rs := &Server{}
+	rs.services = map[string]*Service{}
+	return rs
+}
+
+func (rs *Server) AddService(svc *Service) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.services[svc.name] = svc
+}
+
+func (rs *Server) dispatch(req reqMsg) replyMsg {
+	rs.mu.Lock()
+
+	rs.count += 1
+
+	// split Raft.AppendEntries into service and method
+	dot := strings.LastIndex(req.svcMeth, ".")
+	serviceName := req.svcMeth[:dot]
+	methodName := req.svcMeth[dot+1:]
+
+	service, ok := rs.services[serviceName]
+
+	rs.mu.Unlock()
+
+	if ok {
+		return service.dispatch(methodName, req)
+	} else {
+		choices := []string{}
+		for k, _ := range rs.services {
+			choices = append(choices, k)
+		}
+		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
+			serviceName, serviceName, methodName, choices)
+		return replyMsg{false, nil}
+	}
+}
+
+func (rs *Server) GetCount() int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.count
+}
+
+// an object with methods that can be called via RPC.
+// a single server may have more than one Service.
+type Service struct {
+	name    string
+	rcvr    reflect.Value
+	typ     reflect.Type
+	methods map[string]reflect.Method
+}
+
+func MakeService(rcvr interface{}) *Service {
+	svc := &Service{}
+	svc.typ = reflect.TypeOf(rcvr)
+	svc.rcvr = reflect.ValueOf(rcvr)
+	svc.name = reflect.Indirect(svc.rcvr).Type().Name()
+	svc.methods = map[string]reflect.Method{}
+
+	for m := 0; m < svc.typ.NumMethod(); m++ {
+		method := svc.typ.Method(m)
+		mtype := method.Type
+		mname := method.Name
+
+		//fmt.Printf("%v pp %v ni %v 1k %v 2k %v no %v\n",
+		//	mname, method.PkgPath, mtype.NumIn(), mtype.In(1).Kind(), mtype.In(2).Kind(), mtype.NumOut())
+
+		if method.PkgPath != "" || // capitalized?
+			mtype.NumIn() != 3 ||
+			//mtype.In(1).Kind() != reflect.Ptr ||
+			mtype.In(2).Kind() != reflect.Ptr ||
+			mtype.NumOut() != 0 {
+			// the method is not suitable for a handler
+			//fmt.Printf("bad method: %v\n", mname)
+		} else {
+			// the method looks like a handler
+			svc.methods[mname] = method
+		}
+	}
+
+	return svc
+}
+
+func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
+	if method, ok := svc.methods[methname]; ok {
+		// prepare space into which to read the argument.
+		// the Value's type will be a pointer to req.argsType.
+		args := reflect.New(req.argsType)
+
+		// decode the argument.
+		ab := bytes.NewBuffer(req.args)
+		ad := gob.NewDecoder(ab)
+		ad.Decode(args.Interface())
+
+		// allocate space for the reply.
+		replyType := method.Type.In(2)
+		replyType = replyType.Elem()
+		replyv := reflect.New(replyType)
+
+		// call the method.
+		function := method.Func
+		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyv})
+
+		// encode the reply.
+		rb := new(bytes.Buffer)
+		re := gob.NewEncoder(rb)
+		re.EncodeValue(replyv)
+
+		return replyMsg{true, rb.Bytes()}
+	} else {
+		choices := []string{}
+		for k, _ := range svc.methods {
+			choices = append(choices, k)
+		}
+		log.Fatalf("labrpc.Service.dispatch(): unknown method %v in %v; expecting one of %v\n",
+			methname, req.svcMeth, choices)
+		return replyMsg{false, nil}
+	}
+}
+
+package labrpc
+
+import "testing"
+import "strconv"
+import "sync"
+import "runtime"
+import "time"
+
+type JunkServer struct {
+	mu   sync.Mutex
+	log1 []string
+	log2 []int
+}
+
+func (js *JunkServer) Handler1(args string, reply *int) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	js.log1 = append(js.log1, args)
+	*reply, _ = strconv.Atoi(args)
+}
+
+func (js *JunkServer) Handler2(args int, reply *string) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	js.log2 = append(js.log2, args)
+	*reply = "handler2-" + strconv.Itoa(args)
+}
+
+func (js *JunkServer) Handler3(args int, reply *int) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	time.Sleep(20 * time.Second)
+	*reply = -args
+}
+
+func TestBasic(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	e := rn.MakeEnd("end1-99")
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer("server99", rs)
+
+	rn.Connect("end1-99", "server99")
+	rn.Enable("end1-99", true)
+
+	{
+		reply := ""
+		e.Call("JunkServer.Handler2", 111, &reply)
+		if reply != "handler2-111" {
+			t.Fatalf("wrong reply from Handler2")
+		}
+	}
+
+	{
+		reply := 0
+		e.Call("JunkServer.Handler1", "9099", &reply)
+		if reply != 9099 {
+			t.Fatalf("wrong reply from Handler1")
+		}
+	}
+}
+
+//
+// does net.Enable(endname, false) really disconnect a client?
+//
+func TestDisconnect(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	e := rn.MakeEnd("end1-99")
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer("server99", rs)
+
+	rn.Connect("end1-99", "server99")
+
+	{
+		reply := ""
+		e.Call("JunkServer.Handler2", 111, &reply)
+		if reply != "" {
+			t.Fatalf("unexpected reply from Handler2")
+		}
+	}
+
+	rn.Enable("end1-99", true)
+
+	{
+		reply := 0
+		e.Call("JunkServer.Handler1", "9099", &reply)
+		if reply != 9099 {
+			t.Fatalf("wrong reply from Handler1")
+		}
+	}
+}
+
+//
+// test net.GetCount()
+//
+func TestCounts(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	e := rn.MakeEnd("end1-99")
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer(99, rs)
+
+	rn.Connect("end1-99", 99)
+	rn.Enable("end1-99", true)
+
+	for i := 0; i < 17; i++ {
+		reply := ""
+		e.Call("JunkServer.Handler2", i, &reply)
+		wanted := "handler2-" + strconv.Itoa(i)
+		if reply != wanted {
+			t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+		}
+	}
+
+	n := rn.GetCount(99)
+	if n != 17 {
+		t.Fatalf("wrong GetCount() %v, expected 17\n", n)
+	}
+}
+
+//
+// test RPCs from concurrent ClientEnds
+//
+func TestConcurrentMany(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer(1000, rs)
+
+	ch := make(chan int)
+
+	nclients := 20
+	nrpcs := 10
+	for ii := 0; ii < nclients; ii++ {
+		go func(i int) {
+			n := 0
+			defer func() { ch <- n }()
+
+			e := rn.MakeEnd(i)
+			rn.Connect(i, 1000)
+			rn.Enable(i, true)
+
+			for j := 0; j < nrpcs; j++ {
+				arg := i*100 + j
+				reply := ""
+				e.Call("JunkServer.Handler2", arg, &reply)
+				wanted := "handler2-" + strconv.Itoa(arg)
+				if reply != wanted {
+					t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+				}
+				n += 1
+			}
+		}(ii)
+	}
+
+	total := 0
+	for ii := 0; ii < nclients; ii++ {
+		x := <-ch
+		total += x
+	}
+
+	if total != nclients*nrpcs {
+		t.Fatalf("wrong number of RPCs completed, got %v, expected %v", total, nclients*nrpcs)
+	}
+
+	n := rn.GetCount(1000)
+	if n != total {
+		t.Fatalf("wrong GetCount() %v, expected %v\n", n, total)
+	}
+}
+
+//
+// test unreliable
+//
+func TestUnreliable(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+	rn.Reliable(false)
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer(1000, rs)
+
+	ch := make(chan int)
+
+	nclients := 300
+	for ii := 0; ii < nclients; ii++ {
+		go func(i int) {
+			n := 0
+			defer func() { ch <- n }()
+
+			e := rn.MakeEnd(i)
+			rn.Connect(i, 1000)
+			rn.Enable(i, true)
+
+			arg := i * 100
+			reply := ""
+			ok := e.Call("JunkServer.Handler2", arg, &reply)
+			if ok {
+				wanted := "handler2-" + strconv.Itoa(arg)
+				if reply != wanted {
+					t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+				}
+				n += 1
+			}
+		}(ii)
+	}
+
+	total := 0
+	for ii := 0; ii < nclients; ii++ {
+		x := <-ch
+		total += x
+	}
+
+	if total == nclients || total == 0 {
+		t.Fatalf("all RPCs succeeded despite unreliable")
+	}
+}
+
+//
+// test concurrent RPCs from a single ClientEnd
+//
+func TestConcurrentOne(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer(1000, rs)
+
+	e := rn.MakeEnd("c")
+	rn.Connect("c", 1000)
+	rn.Enable("c", true)
+
+	ch := make(chan int)
+
+	nrpcs := 20
+	for ii := 0; ii < nrpcs; ii++ {
+		go func(i int) {
+			n := 0
+			defer func() { ch <- n }()
+
+			arg := 100 + i
+			reply := ""
+			e.Call("JunkServer.Handler2", arg, &reply)
+			wanted := "handler2-" + strconv.Itoa(arg)
+			if reply != wanted {
+				t.Fatalf("wrong reply %v from Handler2, expecting %v", reply, wanted)
+			}
+			n += 1
+		}(ii)
+	}
+
+	total := 0
+	for ii := 0; ii < nrpcs; ii++ {
+		x := <-ch
+		total += x
+	}
+
+	if total != nrpcs {
+		t.Fatalf("wrong number of RPCs completed, got %v, expected %v", total, nrpcs)
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	if len(js.log2) != nrpcs {
+		t.Fatalf("wrong number of RPCs delivered")
+	}
+
+	n := rn.GetCount(1000)
+	if n != total {
+		t.Fatalf("wrong GetCount() %v, expected %v\n", n, total)
+	}
+}
+
+//
+// regression: an RPC that's delayed during Enabled=false
+// should not delay subsequent RPCs (e.g. after Enabled=true).
+//
+func TestRegression1(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer(1000, rs)
+
+	e := rn.MakeEnd("c")
+	rn.Connect("c", 1000)
+
+	// start some RPCs while the ClientEnd is disabled.
+	// they'll be delayed.
+	rn.Enable("c", false)
+	ch := make(chan bool)
+	nrpcs := 20
+	for ii := 0; ii < nrpcs; ii++ {
+		go func(i int) {
+			ok := false
+			defer func() { ch <- ok }()
+
+			arg := 100 + i
+			reply := ""
+			// this call ought to return false.
+			e.Call("JunkServer.Handler2", arg, &reply)
+			ok = true
+		}(ii)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// now enable the ClientEnd and check that an RPC completes quickly.
+	t0 := time.Now()
+	rn.Enable("c", true)
+	{
+		arg := 99
+		reply := ""
+		e.Call("JunkServer.Handler2", arg, &reply)
+		wanted := "handler2-" + strconv.Itoa(arg)
+		if reply != wanted {
+			t.Fatalf("wrong reply %v from Handler2, expecting %v", reply, wanted)
+		}
+	}
+	dur := time.Since(t0).Seconds()
+
+	if dur > 0.03 {
+		t.Fatalf("RPC took too long (%v) after Enable", dur)
+	}
+
+	for ii := 0; ii < nrpcs; ii++ {
+		<-ch
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	if len(js.log2) != 1 {
+		t.Fatalf("wrong number (%v) of RPCs delivered, expected 1", len(js.log2))
+	}
+
+	n := rn.GetCount(1000)
+	if n != 1 {
+		t.Fatalf("wrong GetCount() %v, expected %v\n", n, 1)
+	}
+}
+
+//
+// if an RPC is stuck in a server, and the server
+// is killed with DeleteServer(), does the RPC
+// get un-stuck?
+//
+func TestKilled(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	rn := MakeNetwork()
+
+	e := rn.MakeEnd("end1-99")
+
+	js := &JunkServer{}
+	svc := MakeService(js)
+
+	rs := MakeServer()
+	rs.AddService(svc)
+	rn.AddServer("server99", rs)
+
+	rn.Connect("end1-99", "server99")
+	rn.Enable("end1-99", true)
+
+	doneCh := make(chan bool)
+	go func() {
+		reply := 0
+		ok := e.Call("JunkServer.Handler3", 99, &reply)
+		doneCh <- ok
+	}()
+
+	time.Sleep(1000 * time.Millisecond)
+
+	select {
+	case <-doneCh:
+		t.Fatalf("Handler3 should not have returned yet")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	rn.DeleteServer("server99")
+
+	select {
+	case x := <-doneCh:
+		if x != false {
+			t.Fatalf("Handler3 returned successfully despite DeleteServer()")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("Handler3 should return after DeleteServer()")
+	}
+}
+
+package lockservice
+
+import "net/rpc"
+import "fmt"
+
+
+//
+// the lockservice Clerk lives in the client
+// and maintains a little state.
+//
+type Clerk struct {
+	servers [2]string // primary port, backup port
+	// Your definitions here.
+}
+
+
+func MakeClerk(primary string, backup string) *Clerk {
+	ck := new(Clerk)
+	ck.servers[0] = primary
+	ck.servers[1] = backup
+	// Your initialization code here.
+	return ck
+}
+
+//
+// call() sends an RPC to the rpcname handler on server srv
+// with arguments args, waits for the reply, and leaves the
+// reply in reply. the reply argument should be the address
+// of a reply structure.
+//
+// call() returns true if the server responded, and false
+// if call() was not able to contact the server. in particular,
+// reply's contents are valid if and only if call() returned true.
+//
+// you should assume that call() will return an
+// error after a while if the server is dead.
+// don't provide your own time-out mechanism.
+//
+// please use call() to send all RPCs, in client.go and server.go.
+// please don't change this function.
+//
+func call(srv string, rpcname string,
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
+}
+
+//
+// ask the lock service for a lock.
+// returns true if the lock service
+// granted the lock, false otherwise.
+//
+// you will have to modify this function.
+//
+func (ck *Clerk) Lock(lockname string) bool {
+	// prepare the arguments.
+	args := &LockArgs{}
+	args.Lockname = lockname
+	var reply LockReply
+
+	// send an RPC request, wait for the reply.
+	ok := call(ck.servers[0], "LockServer.Lock", args, &reply)
+	if ok == false {
+		return false
+	}
+
+	return reply.OK
+}
+
+
+//
+// ask the lock service to unlock a lock.
+// returns true if the lock was previously held,
+// false otherwise.
+//
+
+func (ck *Clerk) Unlock(lockname string) bool {
+
+	// Your code here.
+
+	return false
+}
+
+package lockservice
+
+//
+// RPC definitions for a simple lock service.
+//
+// You will need to modify this file.
+//
+
+//
+// Lock(lockname) returns OK=true if the lock is not held.
+// If it is held, it returns OK=false immediately.
+//
+type LockArgs struct {
+	// Go's net/rpc requires that these field
+	// names start with upper case letters!
+	Lockname string // lock name
+}
+
+type LockReply struct {
+	OK bool
+}
+
+//
+// Unlock(lockname) returns OK=true if the lock was held.
+// It returns OK=false if the lock was not held.
+//
+type UnlockArgs struct {
+	Lockname string
+}
+
+type UnlockReply struct {
+	OK bool
+}
+
+package lockservice
+
+import "net"
+import "net/rpc"
+import "log"
+import "sync"
+import "fmt"
+import "os"
+import "io"
+import "time"
+
+type LockServer struct {
+	mu    sync.Mutex
+	l     net.Listener
+	dead  bool // for test_test.go
+	dying bool // for test_test.go
+
+	am_primary bool   // am I the primary?
+	backup     string // backup's port
+
+	// for each lock name, is it locked?
+	locks map[string]bool
+}
+
+
+//
+// server Lock RPC handler.
+//
+// you will have to modify this function
+//
+func (ls *LockServer) Lock(args *LockArgs, reply *LockReply) error {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+
+	locked, _ := ls.locks[args.Lockname]
+
+	if locked {
+		reply.OK = false
+	} else {
+		reply.OK = true
+		ls.locks[args.Lockname] = true
+	}
+
+	return nil
+}
+
+//
+// server Unlock RPC handler.
+//
+func (ls *LockServer) Unlock(args *UnlockArgs, reply *UnlockReply) error {
+
+	// Your code here.
+
+	return nil
+}
+
+//
+// tell the server to shut itself down.
+// for testing.
+// please don't change this.
+//
+func (ls *LockServer) kill() {
+	ls.dead = true
+	ls.l.Close()
+}
+
+//
+// hack to allow test_test.go to have primary process
+// an RPC but not send a reply. can't use the shutdown()
+// trick b/c that causes client to immediately get an
+// error and send to backup before primary does.
+// please don't change anything to do with DeafConn.
+//
+type DeafConn struct {
+	c io.ReadWriteCloser
+}
+
+func (dc DeafConn) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+func (dc DeafConn) Close() error {
+	return dc.c.Close()
+}
+func (dc DeafConn) Read(p []byte) (n int, err error) {
+	return dc.c.Read(p)
+}
+
+func StartServer(primary string, backup string, am_primary bool) *LockServer {
+	ls := new(LockServer)
+	ls.backup = backup
+	ls.am_primary = am_primary
+	ls.locks = map[string]bool{}
+
+	// Your initialization code here.
+
+
+	me := ""
+	if am_primary {
+		me = primary
+	} else {
+		me = backup
+	}
+
+	// tell net/rpc about our RPC server and handlers.
+	rpcs := rpc.NewServer()
+	rpcs.Register(ls)
+
+	// prepare to receive connections from clients.
+	// change "unix" to "tcp" to use over a network.
+	os.Remove(me) // only needed for "unix"
+	l, e := net.Listen("unix", me)
+	if e != nil {
+		log.Fatal("listen error: ", e)
+	}
+	ls.l = l
+
+	// please don't change any of the following code,
+	// or do anything to subvert it.
+
+	// create a thread to accept RPC connections from clients.
+	go func() {
+		for ls.dead == false {
+			conn, err := ls.l.Accept()
+			if err == nil && ls.dead == false {
+				if ls.dying {
+					// process the request but force discard of reply.
+
+					// without this the connection is never closed,
+					// b/c ServeConn() is waiting for more requests.
+					// test_test.go depends on this two seconds.
+					go func() {
+						time.Sleep(2 * time.Second)
+						conn.Close()
+					}()
+					ls.l.Close()
+
+					// this object has the type ServeConn expects,
+					// but discards writes (i.e. discards the RPC reply).
+					deaf_conn := DeafConn{c: conn}
+
+					rpcs.ServeConn(deaf_conn)
+
+					ls.dead = true
+				} else {
+					go rpcs.ServeConn(conn)
+				}
+			} else if err == nil {
+				conn.Close()
+			}
+			if err != nil && ls.dead == false {
+				fmt.Printf("LockServer(%v) accept: %v\n", me, err.Error())
+				ls.kill()
+			}
+		}
+	}()
+
+	return ls
+}
+
+package lockservice
+
+import "testing"
+import "runtime"
+import "math/rand"
+import "os"
+import "strconv"
+import "time"
+import "fmt"
+
+func tl(t *testing.T, ck *Clerk, lockname string, expected bool) {
+	x := ck.Lock(lockname)
+	if x != expected {
+		t.Fatalf("Lock(%v) returned %v; expected %v", lockname, x, expected)
+	}
+}
+
+func tu(t *testing.T, ck *Clerk, lockname string, expected bool) {
+	x := ck.Unlock(lockname)
+	if x != expected {
+		t.Fatalf("Unlock(%v) returned %v; expected %v", lockname, x, expected)
+	}
+}
+
+//
+// cook up a unique-ish UNIX-domain socket name
+// in /var/tmp. can't use current directory since
+// AFS doesn't support UNIX-domain sockets.
+//
+func port(suffix string) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += suffix
+	return s
+}
+
+func TestBasic(t *testing.T) {
+	fmt.Printf("Test: Basic lock/unlock ...\n")
+
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck := MakeClerk(phost, bhost)
+
+	tl(t, ck, "a", true)
+	tu(t, ck, "a", true)
+
+	tl(t, ck, "a", true)
+	tl(t, ck, "b", true)
+	tu(t, ck, "a", true)
+	tu(t, ck, "b", true)
+
+	tl(t, ck, "a", true)
+	tl(t, ck, "a", false)
+	tu(t, ck, "a", true)
+	tu(t, ck, "a", false)
+
+	p.kill()
+	b.kill()
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail1(t *testing.T) {
+	fmt.Printf("Test: Primary failure ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck := MakeClerk(phost, bhost)
+
+	tl(t, ck, "a", true)
+
+	tl(t, ck, "b", true)
+	tu(t, ck, "b", true)
+
+	tl(t, ck, "c", true)
+	tl(t, ck, "c", false)
+
+	tl(t, ck, "d", true)
+	tu(t, ck, "d", true)
+	tl(t, ck, "d", true)
+
+	p.kill()
+
+	tl(t, ck, "a", false)
+	tu(t, ck, "a", true)
+
+	tu(t, ck, "b", false)
+	tl(t, ck, "b", true)
+
+	tu(t, ck, "c", true)
+
+	tu(t, ck, "d", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail2(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #1 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tl(t, ck1, "b", true)
+
+	p.dying = true
+
+	tl(t, ck2, "c", true)
+	tl(t, ck1, "c", false)
+	tu(t, ck2, "c", true)
+	tl(t, ck1, "c", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail3(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #2 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tl(t, ck1, "b", true)
+
+	p.dying = true
+
+	tl(t, ck1, "b", false)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail4(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #3 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tl(t, ck1, "b", true)
+
+	p.dying = true
+
+	tl(t, ck2, "b", false)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail5(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #4 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tl(t, ck1, "b", true)
+	tu(t, ck1, "b", true)
+
+	p.dying = true
+
+	tu(t, ck1, "b", false)
+	tl(t, ck2, "b", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail6(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #5 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tu(t, ck1, "a", true)
+	tu(t, ck2, "a", false)
+	tl(t, ck1, "b", true)
+
+	p.dying = true
+
+	tu(t, ck2, "b", true)
+	tl(t, ck1, "b", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail7(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #6 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tu(t, ck1, "a", true)
+	tu(t, ck2, "a", false)
+	tl(t, ck1, "b", true)
+
+	p.dying = true
+
+	ch := make(chan bool)
+	go func() {
+		ok := false
+		defer func() { ch <- ok }()
+		tu(t, ck2, "b", true) // 2 second delay until retry
+		ok = true
+	}()
+	time.Sleep(1 * time.Second)
+	tl(t, ck1, "b", true)
+
+	ok := <-ch
+	if ok == false {
+		t.Fatalf("re-sent Unlock did not return true")
+	}
+
+	tu(t, ck1, "b", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPrimaryFail8(t *testing.T) {
+	fmt.Printf("Test: Primary failure just before reply #7 ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck1 := MakeClerk(phost, bhost)
+	ck2 := MakeClerk(phost, bhost)
+
+	tl(t, ck1, "a", true)
+	tu(t, ck1, "a", true)
+
+	p.dying = true
+
+	ch := make(chan bool)
+	go func() {
+		ok := false
+		defer func() { ch <- ok }()
+		tu(t, ck2, "a", false) // 2 second delay until retry
+		ok = true
+	}()
+	time.Sleep(1 * time.Second)
+	tl(t, ck1, "a", true)
+
+	ok := <-ch
+	if ok == false {
+		t.Fatalf("re-sent Unlock did not return false")
+	}
+
+	tu(t, ck1, "a", true)
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestBackupFail(t *testing.T) {
+	fmt.Printf("Test: Backup failure ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	ck := MakeClerk(phost, bhost)
+
+	tl(t, ck, "a", true)
+
+	tl(t, ck, "b", true)
+	tu(t, ck, "b", true)
+
+	tl(t, ck, "c", true)
+	tl(t, ck, "c", false)
+
+	tl(t, ck, "d", true)
+	tu(t, ck, "d", true)
+	tl(t, ck, "d", true)
+
+	b.kill()
+
+	tl(t, ck, "a", false)
+	tu(t, ck, "a", true)
+
+	tu(t, ck, "b", false)
+	tl(t, ck, "b", true)
+
+	tu(t, ck, "c", true)
+
+	tu(t, ck, "d", true)
+
+	p.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestMany(t *testing.T) {
+	fmt.Printf("Test: Multiple clients with primary failure ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	const nclients = 2
+	const nlocks = 10
+	done := false
+	var state [nclients][nlocks]bool
+	var acks [nclients]bool
+
+	for xi := 0; xi < nclients; xi++ {
+		go func(i int) {
+			ck := MakeClerk(phost, bhost)
+			rr := rand.New(rand.NewSource(int64(os.Getpid() + i)))
+			for done == false {
+				locknum := (rr.Int() % nlocks)
+				lockname := strconv.Itoa(locknum + (i * 1000))
+				what := rr.Int() % 2
+				if what == 0 {
+					ck.Lock(lockname)
+					state[i][locknum] = true
+				} else {
+					ck.Unlock(lockname)
+					state[i][locknum] = false
+				}
+			}
+			acks[i] = true
+		}(xi)
+	}
+
+	time.Sleep(2 * time.Second)
+	p.kill()
+	time.Sleep(2 * time.Second)
+	done = true
+	time.Sleep(time.Second)
+	ck := MakeClerk(phost, bhost)
+	for xi := 0; xi < nclients; xi++ {
+		if acks[xi] == false {
+			t.Fatal("one client didn't complete")
+		}
+		for locknum := 0; locknum < nlocks; locknum++ {
+			lockname := strconv.Itoa(locknum + (xi * 1000))
+			locked := !ck.Lock(lockname)
+			if locked != state[xi][locknum] {
+				t.Fatal("bad final state")
+			}
+		}
+	}
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestConcurrentCounts(t *testing.T) {
+	fmt.Printf("Test: Multiple clients, single lock, primary failure ...\n")
+	runtime.GOMAXPROCS(4)
+
+	phost := port("p")
+	bhost := port("b")
+	p := StartServer(phost, bhost, true)  // primary
+	b := StartServer(phost, bhost, false) // backup
+
+	const nclients = 2
+	const nlocks = 1
+	done := false
+	var acks [nclients]bool
+	var locks [nclients][nlocks]int
+	var unlocks [nclients][nlocks]int
+
+	for xi := 0; xi < nclients; xi++ {
+		go func(i int) {
+			ck := MakeClerk(phost, bhost)
+			rr := rand.New(rand.NewSource(int64(os.Getpid() + i)))
+			for done == false {
+				locknum := rr.Int() % nlocks
+				lockname := strconv.Itoa(locknum)
+				what := rr.Int() % 2
+				if what == 0 {
+					if ck.Lock(lockname) {
+						locks[i][locknum]++
+					}
+				} else {
+					if ck.Unlock(lockname) {
+						unlocks[i][locknum]++
+					}
+				}
+			}
+			acks[i] = true
+		}(xi)
+	}
+
+	time.Sleep(2 * time.Second)
+	p.kill()
+	time.Sleep(2 * time.Second)
+	done = true
+	time.Sleep(time.Second)
+	for xi := 0; xi < nclients; xi++ {
+		if acks[xi] == false {
+			t.Fatal("one client didn't complete")
+		}
+	}
+	ck := MakeClerk(phost, bhost)
+	for locknum := 0; locknum < nlocks; locknum++ {
+		nl := 0
+		nu := 0
+		for xi := 0; xi < nclients; xi++ {
+			nl += locks[xi][locknum]
+			nu += unlocks[xi][locknum]
+		}
+		locked := ck.Unlock(strconv.Itoa(locknum))
+		// fmt.Printf("lock=%d nl=%d nu=%d locked=%v\n",
+		//   locknum, nl, nu, locked)
+		if nl < nu || nl > nu+1 {
+			t.Fatal("lock race 1")
+		}
+		if nl == nu && locked != false {
+			t.Fatal("lock race 2")
+		}
+		if nl != nu && locked != true {
+			t.Fatal("lock race 3")
+		}
+	}
+
+	b.kill()
+	fmt.Printf("  ... Passed\n")
+}
+
+package kvpaxos
+
+import "net/rpc"
+import "crypto/rand"
+import "math/big"
+
+import "fmt"
+
+type Clerk struct {
+	servers []string
+	// You will have to modify this struct.
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
+func MakeClerk(servers []string) *Clerk {
+	ck := new(Clerk)
+	ck.servers = servers
+	// You'll have to add code here.
+	return ck
+}
+
+//
+// call() sends an RPC to the rpcname handler on server srv
+// with arguments args, waits for the reply, and leaves the
+// reply in reply. the reply argument should be a pointer
+// to a reply structure.
+//
+// the return value is true if the server responded, and false
+// if call() was not able to contact the server. in particular,
+// the reply's contents are only valid if call() returned true.
+//
+// you should assume that call() will return an
+// error after a while if the server is dead.
+// don't provide your own time-out mechanism.
+//
+// please use call() to send all RPCs, in client.go and server.go.
+// please don't change this function.
+//
+func call(srv string, rpcname string,
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
+}
+
+//
+// fetch the current value for a key.
+// returns "" if the key does not exist.
+// keeps trying forever in the face of all other errors.
+//
+func (ck *Clerk) Get(key string) string {
+	// You will have to modify this function.
+	return ""
+}
+
+//
+// shared by Put and Append.
+//
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+	// You will have to modify this function.
+}
+
+func (ck *Clerk) Put(key string, value string) {
+	ck.PutAppend(key, value, "Put")
+}
+func (ck *Clerk) Append(key string, value string) {
+	ck.PutAppend(key, value, "Append")
+}
+
+package kvpaxos
+
+const (
+	OK       = "OK"
+	ErrNoKey = "ErrNoKey"
+)
+
+type Err string
+
+// Put or Append
+type PutAppendArgs struct {
+	// You'll have to add definitions here.
+	Key   string
+	Value string
+	Op    string // "Put" or "Append"
+	// You'll have to add definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+}
+
+type PutAppendReply struct {
+	Err Err
+}
+
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+}
+
+type GetReply struct {
+	Err   Err
+	Value string
+}
+
+package kvpaxos
+
+import "net"
+import "fmt"
+import "net/rpc"
+import "log"
+import "paxos"
+import "sync"
+import "sync/atomic"
+import "os"
+import "syscall"
+import "encoding/gob"
+import "math/rand"
+
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+}
+
+type KVPaxos struct {
+	mu         sync.Mutex
+	l          net.Listener
+	me         int
+	dead       int32 // for testing
+	unreliable int32 // for testing
+	px         *paxos.Paxos
+
+	// Your definitions here.
+}
+
+
+func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
+	// Your code here.
+	return nil
+}
+
+func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	// Your code here.
+
+	return nil
+}
+
+// tell the server to shut itself down.
+// please do not change these two functions.
+func (kv *KVPaxos) kill() {
+	DPrintf("Kill(%d): die\n", kv.me)
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.l.Close()
+	kv.px.Kill()
+}
+
+// call this to find out if the server is dead.
+func (kv *KVPaxos) isdead() bool {
+	return atomic.LoadInt32(&kv.dead) != 0
+}
+
+// please do not change these two functions.
+func (kv *KVPaxos) setunreliable(what bool) {
+	if what {
+		atomic.StoreInt32(&kv.unreliable, 1)
+	} else {
+		atomic.StoreInt32(&kv.unreliable, 0)
+	}
+}
+
+func (kv *KVPaxos) isunreliable() bool {
+	return atomic.LoadInt32(&kv.unreliable) != 0
+}
+
+//
+// servers[] contains the ports of the set of
+// servers that will cooperate via Paxos to
+// form the fault-tolerant key/value service.
+// me is the index of the current server in servers[].
+//
+func StartServer(servers []string, me int) *KVPaxos {
+	// call gob.Register on structures you want
+	// Go's RPC library to marshall/unmarshall.
+	gob.Register(Op{})
+
+	kv := new(KVPaxos)
+	kv.me = me
+
+	// Your initialization code here.
+
+	rpcs := rpc.NewServer()
+	rpcs.Register(kv)
+
+	kv.px = paxos.Make(servers, me, rpcs)
+
+	os.Remove(servers[me])
+	l, e := net.Listen("unix", servers[me])
+	if e != nil {
+		log.Fatal("listen error: ", e)
+	}
+	kv.l = l
+
+
+	// please do not change any of the following code,
+	// or do anything to subvert it.
+
+	go func() {
+		for kv.isdead() == false {
+			conn, err := kv.l.Accept()
+			if err == nil && kv.isdead() == false {
+				if kv.isunreliable() && (rand.Int63()%1000) < 100 {
+					// discard the request.
+					conn.Close()
+				} else if kv.isunreliable() && (rand.Int63()%1000) < 200 {
+					// process the request but force discard of reply.
+					c1 := conn.(*net.UnixConn)
+					f, _ := c1.File()
+					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+					if err != nil {
+						fmt.Printf("shutdown: %v\n", err)
+					}
+					go rpcs.ServeConn(conn)
+				} else {
+					go rpcs.ServeConn(conn)
+				}
+			} else if err == nil {
+				conn.Close()
+			}
+			if err != nil && kv.isdead() == false {
+				fmt.Printf("KVPaxos(%v) accept: %v\n", me, err.Error())
+				kv.kill()
+			}
+		}
+	}()
+
+	return kv
+}
+
+package kvpaxos
+
+import "testing"
+import "runtime"
+import "strconv"
+import "os"
+import "time"
+import "fmt"
+import "math/rand"
+import "strings"
+import "sync/atomic"
+
+func check(t *testing.T, ck *Clerk, key string, value string) {
+	v := ck.Get(key)
+	if v != value {
+		t.Fatalf("Get(%v) -> %v, expected %v", key, v, value)
+	}
+}
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "kv-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+func cleanup(kva []*KVPaxos) {
+	for i := 0; i < len(kva); i++ {
+		if kva[i] != nil {
+			kva[i].kill()
+		}
+	}
+}
+
+// predict effect of Append(k, val) if old value is prev.
+func NextValue(prev string, val string) string {
+	return prev + val
+}
+
+func TestBasic(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(kva)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("basic", i)
+	}
+	for i := 0; i < nservers; i++ {
+		kva[i] = StartServer(kvh, i)
+	}
+
+	ck := MakeClerk(kvh)
+	var cka [nservers]*Clerk
+	for i := 0; i < nservers; i++ {
+		cka[i] = MakeClerk([]string{kvh[i]})
+	}
+
+	fmt.Printf("Test: Basic put/append/get ...\n")
+
+	ck.Append("app", "x")
+	ck.Append("app", "y")
+	check(t, ck, "app", "xy")
+
+	ck.Put("a", "aa")
+	check(t, ck, "a", "aa")
+
+	cka[1].Put("a", "aaa")
+
+	check(t, cka[2], "a", "aaa")
+	check(t, cka[1], "a", "aaa")
+	check(t, ck, "a", "aaa")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Concurrent clients ...\n")
+
+	for iters := 0; iters < 20; iters++ {
+		const npara = 15
+		var ca [npara]chan bool
+		for nth := 0; nth < npara; nth++ {
+			ca[nth] = make(chan bool)
+			go func(me int) {
+				defer func() { ca[me] <- true }()
+				ci := (rand.Int() % nservers)
+				myck := MakeClerk([]string{kvh[ci]})
+				if (rand.Int() % 1000) < 500 {
+					myck.Put("b", strconv.Itoa(rand.Int()))
+				} else {
+					myck.Get("b")
+				}
+			}(nth)
+		}
+		for nth := 0; nth < npara; nth++ {
+			<-ca[nth]
+		}
+		var va [nservers]string
+		for i := 0; i < nservers; i++ {
+			va[i] = cka[i].Get("b")
+			if va[i] != va[0] {
+				t.Fatalf("mismatch")
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	time.Sleep(1 * time.Second)
+}
+
+func TestDone(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(kva)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("done", i)
+	}
+	for i := 0; i < nservers; i++ {
+		kva[i] = StartServer(kvh, i)
+	}
+	ck := MakeClerk(kvh)
+	var cka [nservers]*Clerk
+	for pi := 0; pi < nservers; pi++ {
+		cka[pi] = MakeClerk([]string{kvh[pi]})
+	}
+
+	fmt.Printf("Test: server frees Paxos log memory...\n")
+
+	ck.Put("a", "aa")
+	check(t, ck, "a", "aa")
+
+	runtime.GC()
+	var m0 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	// rtm's m0.Alloc is 2 MB
+
+	sz := 1000000
+	items := 10
+
+	for iters := 0; iters < 2; iters++ {
+		for i := 0; i < items; i++ {
+			key := strconv.Itoa(i)
+			value := make([]byte, sz)
+			for j := 0; j < len(value); j++ {
+				value[j] = byte((rand.Int() % 100) + 1)
+			}
+			ck.Put(key, string(value))
+			check(t, cka[i%nservers], key, string(value))
+		}
+	}
+
+	// Put and Get to each of the replicas, in case
+	// the Done information is piggybacked on
+	// the Paxos proposer messages.
+	for iters := 0; iters < 2; iters++ {
+		for pi := 0; pi < nservers; pi++ {
+			cka[pi].Put("a", "aa")
+			check(t, cka[pi], "a", "aa")
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+
+	runtime.GC()
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	// rtm's m1.Alloc is 45 MB
+
+	// fmt.Printf("  Memory: before %v, after %v\n", m0.Alloc, m1.Alloc)
+
+	allowed := m0.Alloc + uint64(nservers*items*sz*2)
+	if m1.Alloc > allowed {
+		t.Fatalf("Memory use did not shrink enough (Used: %v, allowed: %v).\n", m1.Alloc, allowed)
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func pp(tag string, src int, dst int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	s += "kv-" + tag + "-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += strconv.Itoa(src) + "-"
+	s += strconv.Itoa(dst)
+	return s
+}
+
+func cleanpp(tag string, n int) {
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			ij := pp(tag, i, j)
+			os.Remove(ij)
+		}
+	}
+}
+
+func part(t *testing.T, tag string, npaxos int, p1 []int, p2 []int, p3 []int) {
+	cleanpp(tag, npaxos)
+
+	pa := [][]int{p1, p2, p3}
+	for pi := 0; pi < len(pa); pi++ {
+		p := pa[pi]
+		for i := 0; i < len(p); i++ {
+			for j := 0; j < len(p); j++ {
+				ij := pp(tag, p[i], p[j])
+				pj := port(tag, p[j])
+				err := os.Link(pj, ij)
+				if err != nil {
+					t.Fatalf("os.Link(%v, %v): %v\n", pj, ij, err)
+				}
+			}
+		}
+	}
+}
+
+func TestPartition(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	tag := "partition"
+	const nservers = 5
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	defer cleanup(kva)
+	defer cleanpp(tag, nservers)
+
+	for i := 0; i < nservers; i++ {
+		var kvh []string = make([]string, nservers)
+		for j := 0; j < nservers; j++ {
+			if j == i {
+				kvh[j] = port(tag, i)
+			} else {
+				kvh[j] = pp(tag, i, j)
+			}
+		}
+		kva[i] = StartServer(kvh, i)
+	}
+	defer part(t, tag, nservers, []int{}, []int{}, []int{})
+
+	var cka [nservers]*Clerk
+	for i := 0; i < nservers; i++ {
+		cka[i] = MakeClerk([]string{port(tag, i)})
+	}
+
+	fmt.Printf("Test: No partition ...\n")
+
+	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+	cka[0].Put("1", "12")
+	cka[2].Put("1", "13")
+	check(t, cka[3], "1", "13")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Progress in majority ...\n")
+
+	part(t, tag, nservers, []int{2, 3, 4}, []int{0, 1}, []int{})
+	cka[2].Put("1", "14")
+	check(t, cka[4], "1", "14")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: No progress in minority ...\n")
+
+	done0 := make(chan bool)
+	done1 := make(chan bool)
+	go func() {
+		cka[0].Put("1", "15")
+		done0 <- true
+	}()
+	go func() {
+		cka[1].Get("1")
+		done1 <- true
+	}()
+
+	select {
+	case <-done0:
+		t.Fatalf("Put in minority completed")
+	case <-done1:
+		t.Fatalf("Get in minority completed")
+	case <-time.After(time.Second):
+	}
+
+	check(t, cka[4], "1", "14")
+	cka[3].Put("1", "16")
+	check(t, cka[4], "1", "16")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Completion after heal ...\n")
+
+	part(t, tag, nservers, []int{0, 2, 3, 4}, []int{1}, []int{})
+
+	select {
+	case <-done0:
+	case <-time.After(30 * 100 * time.Millisecond):
+		t.Fatalf("Put did not complete")
+	}
+
+	select {
+	case <-done1:
+		t.Fatalf("Get in minority completed")
+	default:
+	}
+
+	check(t, cka[4], "1", "15")
+	check(t, cka[0], "1", "15")
+
+	part(t, tag, nservers, []int{0, 1, 2}, []int{3, 4}, []int{})
+
+	select {
+	case <-done1:
+	case <-time.After(100 * 100 * time.Millisecond):
+		t.Fatalf("Get did not complete")
+	}
+
+	check(t, cka[1], "1", "15")
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func randclerk(kvh []string) *Clerk {
+	sa := make([]string, len(kvh))
+	copy(sa, kvh)
+	for i := range sa {
+		j := rand.Intn(i + 1)
+		sa[i], sa[j] = sa[j], sa[i]
+	}
+	return MakeClerk(sa)
+}
+
+// check that all known appends are present in a value,
+// and are in order for each concurrent client.
+func checkAppends(t *testing.T, v string, counts []int) {
+	nclients := len(counts)
+	for i := 0; i < nclients; i++ {
+		lastoff := -1
+		for j := 0; j < counts[i]; j++ {
+			wanted := "x " + strconv.Itoa(i) + " " + strconv.Itoa(j) + " y"
+			off := strings.Index(v, wanted)
+			if off < 0 {
+				t.Fatalf("missing element in Append result")
+			}
+			off1 := strings.LastIndex(v, wanted)
+			if off1 != off {
+				t.Fatalf("duplicate element in Append result")
+			}
+			if off <= lastoff {
+				t.Fatalf("wrong order for element in Append result")
+			}
+			lastoff = off
+		}
+	}
+}
+
+func TestUnreliable(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	const nservers = 3
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	var kvh []string = make([]string, nservers)
+	defer cleanup(kva)
+
+	for i := 0; i < nservers; i++ {
+		kvh[i] = port("un", i)
+	}
+	for i := 0; i < nservers; i++ {
+		kva[i] = StartServer(kvh, i)
+		kva[i].setunreliable(true)
+	}
+
+	ck := MakeClerk(kvh)
+	var cka [nservers]*Clerk
+	for i := 0; i < nservers; i++ {
+		cka[i] = MakeClerk([]string{kvh[i]})
+	}
+
+	fmt.Printf("Test: Basic put/get, unreliable ...\n")
+
+	ck.Put("a", "aa")
+	check(t, ck, "a", "aa")
+
+	cka[1].Put("a", "aaa")
+
+	check(t, cka[2], "a", "aaa")
+	check(t, cka[1], "a", "aaa")
+	check(t, ck, "a", "aaa")
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Sequence of puts, unreliable ...\n")
+
+	for iters := 0; iters < 6; iters++ {
+		const ncli = 5
+		var ca [ncli]chan bool
+		for cli := 0; cli < ncli; cli++ {
+			ca[cli] = make(chan bool)
+			go func(me int) {
+				ok := false
+				defer func() { ca[me] <- ok }()
+				myck := randclerk(kvh)
+				key := strconv.Itoa(me)
+				vv := myck.Get(key)
+				myck.Append(key, "0")
+				vv = NextValue(vv, "0")
+				myck.Append(key, "1")
+				vv = NextValue(vv, "1")
+				myck.Append(key, "2")
+				vv = NextValue(vv, "2")
+				time.Sleep(100 * time.Millisecond)
+				if myck.Get(key) != vv {
+					t.Fatalf("wrong value")
+				}
+				if myck.Get(key) != vv {
+					t.Fatalf("wrong value")
+				}
+				ok = true
+			}(cli)
+		}
+		for cli := 0; cli < ncli; cli++ {
+			x := <-ca[cli]
+			if x == false {
+				t.Fatalf("failure")
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Concurrent clients, unreliable ...\n")
+
+	for iters := 0; iters < 20; iters++ {
+		const ncli = 15
+		var ca [ncli]chan bool
+		for cli := 0; cli < ncli; cli++ {
+			ca[cli] = make(chan bool)
+			go func(me int) {
+				defer func() { ca[me] <- true }()
+				myck := randclerk(kvh)
+				if (rand.Int() % 1000) < 500 {
+					myck.Put("b", strconv.Itoa(rand.Int()))
+				} else {
+					myck.Get("b")
+				}
+			}(cli)
+		}
+		for cli := 0; cli < ncli; cli++ {
+			<-ca[cli]
+		}
+
+		var va [nservers]string
+		for i := 0; i < nservers; i++ {
+			va[i] = cka[i].Get("b")
+			if va[i] != va[0] {
+				t.Fatalf("mismatch; 0 got %v, %v got %v", va[0], i, va[i])
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	fmt.Printf("Test: Concurrent Append to same key, unreliable ...\n")
+
+	ck.Put("k", "")
+
+	ff := func(me int, ch chan int) {
+		ret := -1
+		defer func() { ch <- ret }()
+		myck := randclerk(kvh)
+		n := 0
+		for n < 5 {
+			myck.Append("k", "x "+strconv.Itoa(me)+" "+strconv.Itoa(n)+" y")
+			n++
+		}
+		ret = n
+	}
+
+	ncli := 5
+	cha := []chan int{}
+	for i := 0; i < ncli; i++ {
+		cha = append(cha, make(chan int))
+		go ff(i, cha[i])
+	}
+
+	counts := []int{}
+	for i := 0; i < ncli; i++ {
+		n := <-cha[i]
+		if n < 0 {
+			t.Fatal("client failed")
+		}
+		counts = append(counts, n)
+	}
+
+	vx := ck.Get("k")
+	checkAppends(t, vx, counts)
+
+	{
+		for i := 0; i < nservers; i++ {
+			vi := cka[i].Get("k")
+			if vi != vx {
+				t.Fatalf("mismatch; 0 got %v, %v got %v", vx, i, vi)
+			}
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	time.Sleep(1 * time.Second)
+}
+
+func TestHole(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	fmt.Printf("Test: Tolerates holes in paxos sequence ...\n")
+
+	tag := "hole"
+	const nservers = 5
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	defer cleanup(kva)
+	defer cleanpp(tag, nservers)
+
+	for i := 0; i < nservers; i++ {
+		var kvh []string = make([]string, nservers)
+		for j := 0; j < nservers; j++ {
+			if j == i {
+				kvh[j] = port(tag, i)
+			} else {
+				kvh[j] = pp(tag, i, j)
+			}
+		}
+		kva[i] = StartServer(kvh, i)
+	}
+	defer part(t, tag, nservers, []int{}, []int{}, []int{})
+
+	for iters := 0; iters < 5; iters++ {
+		part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+
+		ck2 := MakeClerk([]string{port(tag, 2)})
+		ck2.Put("q", "q")
+
+		done := int32(0)
+		const nclients = 10
+		var ca [nclients]chan bool
+		for xcli := 0; xcli < nclients; xcli++ {
+			ca[xcli] = make(chan bool)
+			go func(cli int) {
+				ok := false
+				defer func() { ca[cli] <- ok }()
+				var cka [nservers]*Clerk
+				for i := 0; i < nservers; i++ {
+					cka[i] = MakeClerk([]string{port(tag, i)})
+				}
+				key := strconv.Itoa(cli)
+				last := ""
+				cka[0].Put(key, last)
+				for atomic.LoadInt32(&done) == 0 {
+					ci := (rand.Int() % 2)
+					if (rand.Int() % 1000) < 500 {
+						nv := strconv.Itoa(rand.Int())
+						cka[ci].Put(key, nv)
+						last = nv
+					} else {
+						v := cka[ci].Get(key)
+						if v != last {
+							t.Fatalf("%v: wrong value, key %v, wanted %v, got %v",
+								cli, key, last, v)
+						}
+					}
+				}
+				ok = true
+			}(xcli)
+		}
+
+		time.Sleep(3 * time.Second)
+
+		part(t, tag, nservers, []int{2, 3, 4}, []int{0, 1}, []int{})
+
+		// can majority partition make progress even though
+		// minority servers were interrupted in the middle of
+		// paxos agreements?
+		check(t, ck2, "q", "q")
+		ck2.Put("q", "qq")
+		check(t, ck2, "q", "qq")
+
+		// restore network, wait for all threads to exit.
+		part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+		atomic.StoreInt32(&done, 1)
+		ok := true
+		for i := 0; i < nclients; i++ {
+			z := <-ca[i]
+			ok = ok && z
+		}
+		if ok == false {
+			t.Fatal("something is wrong")
+		}
+		check(t, ck2, "q", "qq")
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestManyPartition(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	fmt.Printf("Test: Many clients, changing partitions ...\n")
+
+	tag := "many"
+	const nservers = 5
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	defer cleanup(kva)
+	defer cleanpp(tag, nservers)
+
+	for i := 0; i < nservers; i++ {
+		var kvh []string = make([]string, nservers)
+		for j := 0; j < nservers; j++ {
+			if j == i {
+				kvh[j] = port(tag, i)
+			} else {
+				kvh[j] = pp(tag, i, j)
+			}
+		}
+		kva[i] = StartServer(kvh, i)
+		kva[i].setunreliable(true)
+	}
+	defer part(t, tag, nservers, []int{}, []int{}, []int{})
+	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+
+	done := int32(0)
+
+	// re-partition periodically
+	ch1 := make(chan bool)
+	go func() {
+		defer func() { ch1 <- true }()
+		for atomic.LoadInt32(&done) == 0 {
+			var a [nservers]int
+			for i := 0; i < nservers; i++ {
+				a[i] = (rand.Int() % 3)
+			}
+			pa := make([][]int, 3)
+			for i := 0; i < 3; i++ {
+				pa[i] = make([]int, 0)
+				for j := 0; j < nservers; j++ {
+					if a[j] == i {
+						pa[i] = append(pa[i], j)
+					}
+				}
+			}
+			part(t, tag, nservers, pa[0], pa[1], pa[2])
+			time.Sleep(time.Duration(rand.Int63()%200) * time.Millisecond)
+		}
+	}()
+
+	const nclients = 10
+	var ca [nclients]chan bool
+	for xcli := 0; xcli < nclients; xcli++ {
+		ca[xcli] = make(chan bool)
+		go func(cli int) {
+			ok := false
+			defer func() { ca[cli] <- ok }()
+			sa := make([]string, nservers)
+			for i := 0; i < nservers; i++ {
+				sa[i] = port(tag, i)
+			}
+			for i := range sa {
+				j := rand.Intn(i + 1)
+				sa[i], sa[j] = sa[j], sa[i]
+			}
+			myck := MakeClerk(sa)
+			key := strconv.Itoa(cli)
+			last := ""
+			myck.Put(key, last)
+			for atomic.LoadInt32(&done) == 0 {
+				if (rand.Int() % 1000) < 500 {
+					nv := strconv.Itoa(rand.Int())
+					myck.Append(key, nv)
+					last = NextValue(last, nv)
+				} else {
+					v := myck.Get(key)
+					if v != last {
+						t.Fatalf("%v: get wrong value, key %v, wanted %v, got %v",
+							cli, key, last, v)
+					}
+				}
+			}
+			ok = true
+		}(xcli)
+	}
+
+	time.Sleep(20 * time.Second)
+	atomic.StoreInt32(&done, 1)
+	<-ch1
+	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+
+	ok := true
+	for i := 0; i < nclients; i++ {
+		z := <-ca[i]
+		ok = ok && z
+	}
+
+	if ok {
+		fmt.Printf("  ... Passed\n")
+	}
+}
